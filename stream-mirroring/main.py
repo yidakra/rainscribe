@@ -31,7 +31,7 @@ load_dotenv()
 
 # Configuration from environment variables with defaults
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/shared-data")
-INPUT_URL = os.getenv("INPUT_URL")
+INPUT_URL = os.getenv("INPUT_URL") or os.getenv("HLS_STREAM_URL")  # Fallback to HLS_STREAM_URL if INPUT_URL is not set
 OUTPUT_DIR = f"{SHARED_VOLUME_PATH}/hls"
 WEBVTT_DIR = f"{SHARED_VOLUME_PATH}/webvtt"
 FFMPEG_LOGS_DIR = f"{SHARED_VOLUME_PATH}/logs"
@@ -104,6 +104,10 @@ def build_ffmpeg_command():
     # Format datetime for FFmpeg
     formatted_datetime = reference_date.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     
+    # Ensure INPUT_URL is set
+    input_url = INPUT_URL or os.getenv("HLS_STREAM_URL") or "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
+    logger.info(f"Using input URL: {input_url}")
+    
     # Create command
     cmd = [
         "ffmpeg",
@@ -116,7 +120,7 @@ def build_ffmpeg_command():
         "-reconnect_delay_max", "30",
         
         # Input stream
-        "-i", INPUT_URL,
+        "-i", input_url,
         
         # Add subtitles input (will be used if webvtt files are available)
         "-i", f"{WEBVTT_DIR}/playlist.m3u8",
@@ -156,13 +160,22 @@ def build_ffmpeg_command():
         # Subtitle codec options
         "-c:s", "webvtt",
         
-        # HLS options
+        # Output HLS settings
         "-f", "hls",
         "-hls_time", str(HLS_SEGMENT_TIME),
         "-hls_list_size", str(HLS_LIST_SIZE),
-        "-hls_flags", "delete_segments+independent_segments",
+        "-hls_flags", "delete_segments+independent_segments+program_date_time",
         "-hls_segment_type", "mpegts",
-        "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%d.ts",
+        "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%05d.ts",
+        
+        # Enable subtitle streams in playlist
+        "-hls_subtitle_path", f"{WEBVTT_DIR}/ru/",
+        
+        # Synchronization options
+        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
+        
+        # Output file
+        f"{OUTPUT_DIR}/playlist.m3u8"
     ])
     
     # Add program-date-time if enabled
@@ -171,9 +184,6 @@ def build_ffmpeg_command():
             "-hls_flags", "program_date_time",
             "-program_date_time", formatted_datetime
         ])
-    
-    # Output path
-    cmd.extend([f"{OUTPUT_DIR}/playlist.m3u8"])
     
     logger.info(f"FFmpeg command: {' '.join(cmd)}")
     return cmd, log_file
@@ -194,6 +204,14 @@ async def run_ffmpeg():
         try:
             # Build FFmpeg command and get log file path
             ffmpeg_cmd, log_file = build_ffmpeg_command()
+            
+            # Debug: Print each item in the command
+            logger.info("FFmpeg command items:")
+            for i, item in enumerate(ffmpeg_cmd):
+                logger.info(f"  Item {i}: {repr(item)}")
+            
+            # Filter out None values from the command
+            ffmpeg_cmd = [str(item) if item is not None else "NONE_VALUE" for item in ffmpeg_cmd]
             
             logger.info(f"Starting FFmpeg (attempt {retries+1}/{MAX_RETRIES})")
             

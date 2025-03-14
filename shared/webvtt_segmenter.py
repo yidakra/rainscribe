@@ -349,59 +349,43 @@ class WebVTTSegmenter:
     def generate_playlist(self, start_index: int, end_index: int, 
                          output_path: str, segment_template: str = "subtitles_{index}.vtt") -> str:
         """
-        Generate an HLS subtitle playlist.
+        Generate an HLS playlist (m3u8) for the subtitle segments.
         
         Args:
-            start_index: First segment index to include
-            end_index: Last segment index to include (inclusive)
-            output_path: Path to write the playlist to
-            segment_template: Template for segment filenames
+            start_index: Starting segment index (inclusive)
+            end_index: Ending segment index (inclusive)
+            output_path: Path to save the playlist file
+            segment_template: Template for segment filenames, can be either Python format string with {index} or C-style format string with %d
             
         Returns:
             str: Path to the generated playlist file
         """
-        # Ensure parent directory exists
+        # Ensure directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
-        # Generate playlist content
+        # Generate m3u8 content
         content = "#EXTM3U\n"
         content += f"#EXT-X-TARGETDURATION:{int(self.segment_duration)}\n"
         content += "#EXT-X-VERSION:3\n"
-        content += "#EXT-X-MEDIA-SEQUENCE:{}\n".format(start_index)
-        content += "#EXT-X-PLAYLIST-TYPE:EVENT\n"
+        content += f"#EXT-X-MEDIA-SEQUENCE:{start_index}\n"
         
-        # Add entries for each segment
-        for index in range(start_index, end_index + 1):
-            filename = segment_template.format(index=index)
-            content += f"#EXTINF:{self.segment_duration:.6f},\n"
-            content += f"{filename}\n"
+        for i in range(start_index, end_index + 1):
+            content += f"#EXTINF:{self.segment_duration:.3f},\n"
+            # Handle both Python format strings and C-style format strings
+            if "{index}" in segment_template:
+                segment_filename = segment_template.format(index=i)
+            else:
+                segment_filename = segment_template % i
+            content += segment_filename + "\n"
         
-        # Add end marker for a live playlist
-        if False:  # Only for VOD playlists
-            content += "#EXT-X-ENDLIST\n"
+        # No need to add #EXT-X-ENDLIST for live streams
         
-        # Write to file
-        try:
-            # Write to temporary file first for atomicity
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, 
-                                           dir=os.path.dirname(output_path)) as temp_file:
-                temp_file.write(content)
-                temp_path = temp_file.name
-                
-            # Rename to target (atomic operation)
-            os.replace(temp_path, output_path)
-            
-            logger.info(f"Generated VTT playlist at {output_path}")
-            return output_path
-        except Exception as e:
-            logger.error(f"Failed to write playlist: {str(e)}")
-            # Try to clean up temp file if it exists
-            try:
-                if 'temp_path' in locals() and os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except:
-                pass
-            return ""
+        # Write the playlist file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        logger.info(f"Generated subtitle playlist: {output_path}")
+        return output_path
 
     def get_segment_start_time(self, segment_index: int) -> float:
         """

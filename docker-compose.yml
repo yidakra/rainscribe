@@ -101,6 +101,8 @@ services:
       - FFMPEG_COPYTS=1
       - FFMPEG_START_AT_ZERO=1
       - FFMPEG_SEGMENT_DURATION=10
+      # Input URL for the stream
+      - INPUT_URL=${HLS_STREAM_URL}
     volumes:
       - shared-data:/shared-data
     depends_on:
