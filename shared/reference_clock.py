@@ -239,9 +239,10 @@ class ReferenceClock:
                 # Save the failure state
                 self._save_state()
                 
-                # If we've failed too many times in a row, we should alert
-                if self.sync_failures >= 3:
-                    logger.error(f"Failed to sync clock {self.sync_failures} times in a row!")
+                # If we've failed too many times in a row, we should alert but not too severely
+                if self.sync_failures % 10 == 0:  # Only log every 10 failures to reduce noise
+                    logger.warning(f"Failed to sync clock {self.sync_failures} times in a row!")
+                    # But don't block the application, just continue with the current time
                 
                 return False
     

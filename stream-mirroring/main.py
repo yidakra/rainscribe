@@ -92,61 +92,38 @@ def stop_ffmpeg():
             ffmpeg_process = None
 
 def build_ffmpeg_command():
-    """Build the FFmpeg command with all options."""
-    # Generate timestamp for log file
+    """Build the FFmpeg command for stream mirroring."""
+    # Create a timestamp for the log file
     timestamp = int(time.time())
     log_file = f"{FFMPEG_LOGS_DIR}/ffmpeg_{timestamp}.log"
     
-    # Get reference time to set program-date-time values
-    reference_time = get_time()
-    reference_date = datetime.fromtimestamp(reference_time)
+    # Determine subtitle input
+    subtitle_input = f"{WEBVTT_DIR}/ru/playlist.m3u8"
     
-    # Format datetime for FFmpeg
-    formatted_datetime = reference_date.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-    
-    # Ensure INPUT_URL is set
-    input_url = INPUT_URL or os.getenv("HLS_STREAM_URL") or "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
-    logger.info(f"Using input URL: {input_url}")
-    
-    # Create command
-    cmd = [
+    # Build the FFmpeg command
+    cmd = list(filter(None, [
         "ffmpeg",
+        
+        # Logging options
         "-loglevel", "info",
         
-        # Input options
+        # Input options for the main stream
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "30",
+        "-i", INPUT_URL,
         
-        # Input stream
-        "-i", input_url,
-        
-        # Add subtitles input (will be used if webvtt files are available)
-        "-i", f"{WEBVTT_DIR}/playlist.m3u8",
+        # Input options for subtitles
+        "-i", subtitle_input,
         
         # Global options
         "-y",                      # Overwrite output files
-    ]
-    
-    # Add timestamp copying if enabled
-    if USE_COPYTS:
-        cmd.extend(["-copyts"])
-    
-    # Start at zero option
-    if START_AT_ZERO:
-        cmd.extend(["-start_at_zero"])
-    
-    # Avoid negative timestamps
-    cmd.extend(["-avoid_negative_ts", "1"])
-    
-    # Add extra FFmpeg options if specified
-    if FFMPEG_EXTRA_OPTIONS:
-        cmd.extend(shlex.split(FFMPEG_EXTRA_OPTIONS))
-    
-    # Continue with mapping and output options
-    cmd.extend([
-        # Map audio and video streams
+        "-copyts",                 # Copy timestamps
+        "-start_at_zero",          # Start at zero
+        "-avoid_negative_ts", "1", # Avoid negative timestamps
+        
+        # Stream mapping
         "-map", "0:v:0",          # Map video from input 0
         "-map", "0:a:0",          # Map audio from input 0
         "-map", "1:s?",           # Map subtitles from input 1 if available
@@ -169,21 +146,17 @@ def build_ffmpeg_command():
         "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%05d.ts",
         
         # Enable subtitle streams in playlist
-        "-hls_subtitle_path", f"{WEBVTT_DIR}/ru/",
+        "-hls_subtitle_path", f"{OUTPUT_DIR}/subtitles/",
         
         # Synchronization options
         "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
         
+        # Allow all file extensions (needed for .vtt files)
+        "-allowed_extensions", "ALL",
+        
         # Output file
         f"{OUTPUT_DIR}/playlist.m3u8"
-    ])
-    
-    # Add program-date-time if enabled
-    if USE_PROGRAM_DATE_TIME:
-        cmd.extend([
-            "-hls_flags", "program_date_time",
-            "-program_date_time", formatted_datetime
-        ])
+    ]))
     
     logger.info(f"FFmpeg command: {' '.join(cmd)}")
     return cmd, log_file
@@ -195,6 +168,7 @@ async def run_ffmpeg():
     # Ensure directories exist
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(FFMPEG_LOGS_DIR, exist_ok=True)
+    os.makedirs(f"{OUTPUT_DIR}/subtitles", exist_ok=True)
     
     # Create master playlist with reference to subtitle tracks
     create_master_playlist()
@@ -216,80 +190,79 @@ async def run_ffmpeg():
             logger.info(f"Starting FFmpeg (attempt {retries+1}/{MAX_RETRIES})")
             
             # Start the process
-            with open(log_file, 'w') as f:
-                ffmpeg_process = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
-                    bufsize=1,
-                    universal_newlines=True
-                )
-            
-            # Record start time for metrics
-            start_time = time.time()
-            restart_count += 1
-            
-            # Update metrics
-            sync_metrics.metrics.add_metric("stream_start_time", start_time)
-            sync_metrics.metrics.add_metric("ffmpeg_restarts", restart_count)
-            sync_metrics.record_health_check("ffmpeg_running", True)
-            
-            logger.info(f"FFmpeg process started (PID: {ffmpeg_process.pid})")
-            
-            # Wait for process to finish
-            while ffmpeg_process.poll() is None:
-                # Check if we should exit
-                if not running:
-                    logger.info("Shutdown requested, stopping FFmpeg")
-                    stop_ffmpeg()
-                    break
+            try:
+                with open(log_file, 'w') as f:
+                    ffmpeg_process = subprocess.Popen(
+                        ffmpeg_cmd,
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                        universal_newlines=True
+                    )
                 
-                await asyncio.sleep(1)
-            
-            # Check exit status
-            if ffmpeg_process and ffmpeg_process.returncode != 0 and running:
-                # FFmpeg exited with error
-                logger.error(f"FFmpeg exited with code {ffmpeg_process.returncode}")
-                logger.error(f"Check log file: {log_file}")
-                sync_metrics.record_error("ffmpeg_exit_error")
+                # Record start time for metrics
+                start_time = time.time()
+                restart_count += 1
+                
+                # Update metrics
+                sync_metrics.metrics.add_metric("stream_start_time", start_time)
+                sync_metrics.metrics.add_metric("ffmpeg_restarts", restart_count)
+                sync_metrics.record_health_check("ffmpeg_running", True)
+                
+                logger.info(f"FFmpeg process started (PID: {ffmpeg_process.pid if ffmpeg_process else 'Unknown'})")
+                
+                # Wait for process to finish
+                while ffmpeg_process and ffmpeg_process.poll() is None:
+                    # Check if we should exit
+                    if not running:
+                        logger.info("Shutdown requested, stopping FFmpeg")
+                        stop_ffmpeg()
+                        break
+                    
+                    await asyncio.sleep(1)
+                
+                # Check process exit code
+                if ffmpeg_process:
+                    exit_code = ffmpeg_process.returncode
+                    logger.info(f"FFmpeg process exited with code {exit_code}")
+                    
+                    if exit_code != 0:
+                        logger.error(f"FFmpeg failed with exit code {exit_code}")
+                        with open(log_file, 'r') as f:
+                            last_lines = f.readlines()[-20:]  # Get last 20 lines
+                            logger.error(f"Last FFmpeg log lines: {''.join(last_lines)}")
+                else:
+                    logger.error("FFmpeg process was None, possible initialization error")
+            except Exception as e:
+                logger.error(f"Error starting FFmpeg process: {str(e)}")
                 sync_metrics.record_health_check("ffmpeg_running", False)
                 
-                # Calculate retry delay with jitter to avoid thundering herd
-                delay = RETRY_DELAY * (1 + random.uniform(-JITTER_FACTOR, JITTER_FACTOR))
-                logger.info(f"Retrying in {delay:.2f} seconds...")
-                
-                # Increment retry count
-                retries += 1
-                
-                # Wait before retrying
-                for _ in range(int(delay)):
-                    if not running:
-                        break
-                    await asyncio.sleep(1)
-            else:
-                # Normal exit or shutdown requested
-                logger.info("FFmpeg process stopped normally or shutdown requested")
-                break
-                
-        except Exception as e:
-            logger.error(f"Error running FFmpeg: {e}")
-            sync_metrics.record_error("ffmpeg_error")
+            # If we get here, the process has exited or we caught an exception
             sync_metrics.record_health_check("ffmpeg_running", False)
             
-            # Calculate retry delay with jitter
-            delay = RETRY_DELAY * (1 + random.uniform(-JITTER_FACTOR, JITTER_FACTOR))
-            logger.info(f"Retrying in {delay:.2f} seconds...")
+            # Retry with exponential backoff
             retries += 1
+            retry_delay = min(RETRY_DELAY * (2 ** (retries - 1)) + random.uniform(0, 1), RETRY_DELAY * 2)
+            logger.info(f"Retrying in {retry_delay:.2f} seconds...")
             
             # Wait before retrying
-            for _ in range(int(delay)):
-                if not running:
-                    break
-                await asyncio.sleep(1)
+            await asyncio.sleep(retry_delay)
+            
+        except Exception as e:
+            logger.error(f"Error running FFmpeg: {str(e)}")
+            sync_metrics.record_health_check("ffmpeg_running", False)
+            
+            # Retry with exponential backoff
+            retries += 1
+            retry_delay = min(RETRY_DELAY * (2 ** (retries - 1)) + random.uniform(0, 1), RETRY_DELAY * 2)
+            logger.info(f"Retrying in {retry_delay:.2f} seconds...")
+            
+            # Wait before retrying
+            await asyncio.sleep(retry_delay)
     
-    if retries >= MAX_RETRIES and running:
-        logger.critical(f"Failed to start FFmpeg after {MAX_RETRIES} attempts, giving up")
-        sync_metrics.record_error("ffmpeg_max_retries")
+    # If we've exhausted all retries, log a critical error
+    if retries >= MAX_RETRIES:
+        logger.critical(f"Failed to run FFmpeg after {MAX_RETRIES} attempts. Giving up.")
     
     logger.info("Stream mirroring stopped")
 
@@ -389,13 +362,30 @@ def main():
     logger.info(f"Output directory: {OUTPUT_DIR}")
     
     try:
-        # Synchronize reference clock
+        # Get reference clock
         reference_clock = get_global_clock()
-        reference_clock.sync_once()
-        logger.info(f"Reference clock synchronized: {get_formatted_time()}")
         
-        # Start metrics server
-        metrics_manager.start_server()
+        # Try to synchronize, but continue even if it fails
+        try:
+            # Try to sync, but don't wait for too many retries
+            sync_success = reference_clock.sync_once()
+            if sync_success:
+                logger.info(f"Reference clock synchronized: {get_formatted_time()}")
+            else:
+                logger.warning("Failed to sync with NTP servers, but continuing anyway")
+            
+            # Debug metrics_manager
+            logger.info(f"Metrics manager: {metrics_manager}")
+            logger.info(f"Metrics manager dir: {dir(metrics_manager)}")
+        except Exception as e:
+            logger.warning(f"Failed to synchronize reference clock: {e}. Continuing anyway.")
+        
+        # Force continue even if sync fails
+        logger.info(f"Proceeding with reference clock time: {get_formatted_time()}")
+        
+        # Start metrics server if available
+        if hasattr(metrics_manager, 'start_server'):
+            metrics_manager.start_server()
         
         # Run async tasks
         asyncio.run(run_async_tasks())
