@@ -1,105 +1,128 @@
-# rainscribe: Automated Real-time Transcription for HLS
+# Rainscribe
 
-A scalable, containerized solution for real-time transcription of Russian TV streams with WebVTT subtitle generation and precise synchronization.
+Rainscribe is a comprehensive system for real-time video streaming with synchronized subtitles, designed for live broadcasting applications. It captures audio from HLS streams, uses transcription services to generate subtitles, and adds those subtitles to the output stream.
 
-## System Overview
+## System Components
 
-rainscribe processes a live HLS stream by:
-1. Extracting audio from an HLS stream in real-time
-2. Using Gladia API for real-time transcription with word-level timestamps in Russian
-3. Converting transcription data into synchronized WebVTT subtitles
-4. Mirroring the original video stream with added subtitles
-5. Serving the resulting HLS content via NGINX
+- **Audio Extractor**: Extracts audio from an HLS stream
+- **Transcription Service**: Transcribes the audio in real-time
+- **Caption Generator**: Generates WebVTT subtitles from transcriptions
+- **Stream Mirroring**: Re-encodes the HLS stream with the generated subtitles
+- **Nginx**: Serves the HLS stream with subtitles
 
-## Architecture
+## Key Features
 
-The solution consists of several microservices:
+- Real-time audio extraction from HLS streams
+- Low-latency transcription processing
+- Precise synchronization between video and subtitles
+- Robust timing management via centralized reference clock
+- HLS-compatible WebVTT subtitle generation
+- Containerized microservice architecture
 
-- **Audio Extractor Service**: Captures the HLS stream and extracts audio
-- **Transcription Service**: Uses Gladia API to generate Russian transcriptions with word-level timestamps
-- **Caption Generator Service**: Converts transcription data into WebVTT subtitle files with precise synchronization
-- **Stream Mirroring Service**: Merges original video with subtitles to create a new HLS stream using EXT-X-PROGRAM-DATE-TIME for synchronization
-- **NGINX Server**: Hosts the final HLS content (manifests, video segments, WebVTT files)
+## Clock Synchronization System
 
-## Synchronization
+Rainscribe uses a sophisticated time synchronization system to ensure that all components work with a consistent time reference:
 
-The system uses several mechanisms to ensure accurate synchronization between video and subtitles:
+- **Reference Clock**: A centralized clock that synchronizes with NTP servers to provide a global time reference
+- **State Persistence**: Clock state is saved to file or Redis to maintain consistent timing across service restarts
+- **Offset Calculation**: A robust algorithm for calculating and smoothing timing offsets between audio/video streams
+- **HLS Segment Alignment**: WebVTT segments are precisely aligned with HLS video segments
 
-1. **Reference Clock**: A shared reference time used by all services to coordinate timestamps
-2. **Latency Measurement**: The transcription service measures pipeline latency and adjusts timestamps accordingly
-3. **Adaptive Offset**: The caption generator dynamically adjusts timestamp offsets to compensate for drift
-4. **EXT-X-PROGRAM-DATE-TIME Tags**: The stream mirroring service adds program date timestamps to ensure proper playback alignment
+## Configuration
 
-## Synchronization Framework Improvements
+The system can be configured through environment variables. See the `.env` file for an example configuration.
 
-Recent improvements to the synchronization framework include:
+### Core Environment Variables
 
-### 1. Reference Clock System
+- `HLS_STREAM_URL`: URL of the input HLS stream to process
+- `SHARED_VOLUME_PATH`: Path to the shared volume where files are stored (default: `/shared-data`)
+- `WEBVTT_SEGMENT_DURATION`: Duration of each WebVTT segment in seconds (default: 10)
+- `TRANSCRIPTION_LANGUAGE`: Language code for transcription (default: "ru")
+- `GLADIA_API_KEY`: API key for Gladia transcription service (required)
 
-A unified reference clock system has been implemented to provide a consistent time reference across all components of the system. This ensures that all services work with the same time information, eliminating drift and inconsistencies.
+### Clock and Synchronization Variables
 
-Features:
-- NTP-based synchronization with external time sources
-- Drift compensation and monitoring
-- Persistent state to maintain clock accuracy across restarts
-- Easy-to-use global clock instance for all services
+- `CLOCK_UPDATE_INTERVAL`: How often to sync with NTP servers in seconds (default: 3600)
+- `CLOCK_MAX_DRIFT`: Maximum allowed drift in seconds before correction (default: 0.1)
+- `CLOCK_STATE_FILE`: Path to store clock state (default: "~/.rainscribe/clock_state.json")
+- `USE_REDIS_FOR_CLOCK`: Whether to use Redis for clock state storage (default: false)
+- `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB`: Redis connection parameters if Redis is enabled
 
-### 2. Enhanced Offset Calculation
+### Offset Calculation Variables
 
-The offset calculation system has been improved with advanced smoothing algorithms to provide stable synchronization even with noisy measurements.
+- `OFFSET_WINDOW_SIZE`: Number of measurements to keep for smoothing (default: 30)
+- `OFFSET_EMA_ALPHA`: EMA weight for new measurements (default: 0.15, lower = more smoothing)
+- `OFFSET_OUTLIER_THRESHOLD`: Standard deviations for outlier detection (default: 2.5)
+- `OFFSET_MEDIAN_WEIGHT`: Weight of median in calculation (default: 0.4, higher = more stable)
+- `OFFSET_STATE_FILE`: Path to store offset state (default: "~/.rainscribe/offset_state.json")
 
-Features:
-- Exponential Moving Average (EMA) smoothing
-- Outlier detection and removal
-- Statistical analysis of offset measurements
-- Automatic adaptation to changing conditions
+### FFmpeg Configuration
 
-### 3. WebVTT Segment Alignment
-
-WebVTT subtitles are now properly segmented to align perfectly with HLS video segments, ensuring consistent synchronization across all playback platforms.
-
-Features:
-- Time-based segmentation with configurable duration
-- Segment boundary overlap handling
-- Automatic timestamp adjustment
-- HLS playlist generation
-
-### 4. Centralized Logging
-
-A standardized logging system ensures consistent log format and collection across all services.
-
-Features:
-- Multiple log levels and formats (text, JSON)
-- File rotation and retention policies
-- Centralized configuration
-
-### 5. Monitoring and Metrics
-
-Real-time monitoring of synchronization quality and system performance helps identify and address issues quickly.
-
-Features:
-- System resource usage tracking
-- Synchronization metrics collection
-- Latency and offset measurements
-- Dashboard data generation
-- Persistent metrics storage
+- `FFMPEG_COPYTS`: Whether to use -copyts option (default: 1)
+- `FFMPEG_START_AT_ZERO`: Whether to use -start_at_zero option (default: 1)
+- `FFMPEG_SEGMENT_DURATION`: Duration of HLS segments in seconds (default: 10)
+- `FFMPEG_MAX_RETRIES`: Maximum number of FFmpeg restart attempts (default: 10)
+- `FFMPEG_RETRY_DELAY`: Delay between restart attempts in seconds (default: 5)
+- `FFMPEG_EXTRA_OPTIONS`: Additional FFmpeg command-line options
 
 ## Deployment
 
-The solution is containerized using Docker and deployed on Kubernetes with Helm charts.
+### Using Docker Compose (Development)
 
-## Prerequisites
+1. Edit the `.env` file to set up your configuration
+2. Start the services:
 
-- Python 3.10+
-- Poetry for dependency management
-- Docker and Kubernetes
-- Rancher Desktop
-- Helm
+```bash
+docker-compose up -d
+```
+
+3. Access the stream at http://localhost:8080/master.m3u8
+
+### Using Kubernetes (Production)
+
+1. Configure your values in the Helm chart (`helm-chart/values.yaml`)
+2. Deploy using Helm:
+
+```bash
+helm install rainscribe ./helm-chart
+```
+
+## Troubleshooting
+
+### Clock Synchronization Issues
+
+If subtitles appear out of sync with the video:
+
+1. Check the reference clock metrics (`http://localhost:8080/metrics`)
+2. Verify that the clock offset is stable and not drifting
+3. Adjust `OFFSET_EMA_ALPHA` and `OFFSET_MEDIAN_WEIGHT` to tune the offset calculation
+4. Ensure all services are using the same `WEBVTT_SEGMENT_DURATION` and `FFMPEG_SEGMENT_DURATION`
+
+### FFmpeg Errors
+
+If you see FFmpeg crashing or producing errors:
+
+1. Check the FFmpeg logs in `/shared-data/logs/`
+2. Consider adjusting buffer sizes or adding specific FFmpeg options using `FFMPEG_EXTRA_OPTIONS`
+3. Ensure all services are using the same segment duration (10 seconds by default)
+
+### Subtitle Display Issues
+
+If subtitles are not appearing or are appearing incorrectly:
+
+1. Verify that the WebVTT files are being generated in `/shared-data/webvtt/`
+2. Check that the master playlist references the subtitle tracks correctly
+3. Adjust `SUBTITLE_DISPLAY_WINDOW` if subtitles are disappearing too quickly
+4. Use a player that supports HLS with WebVTT subtitles (like VLC or hls.js-based players)
+
+## Monitoring
+
+The system exposes metrics for monitoring:
+
+- Each service exposes metrics on its `/metrics` endpoint
+- Metrics include timing offsets, process health, and synchronization status
+- The metrics can be collected by Prometheus and visualized with Grafana
 
 ## License
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+This project is licensed under the MIT License - see the LICENSE file for details.

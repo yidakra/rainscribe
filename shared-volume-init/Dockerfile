@@ -1,10 +1,12 @@
-FROM busybox:1.36
+FROM alpine:3.17
+
+WORKDIR /app
 
 # Copy initialization script
-COPY shared-volume-init/init.sh /init.sh
+COPY shared-volume-init/init.sh /app/init.sh
 
-# Make the script executable
-RUN chmod +x /init.sh
+# Make it executable
+RUN chmod +x /app/init.sh
 
-# Command to run the initialization script
-CMD ["/init.sh"] 
+# Run script when container starts
+CMD ["/app/init.sh"] 

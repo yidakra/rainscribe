@@ -1,112 +1,197 @@
-# rainscribe Usage Guide
+# Using Rainscribe
 
-This document provides instructions on how to build, run, and deploy the rainscribe system for automated transcription and translation of Russian TV streams.
+This document contains detailed instructions for setting up, running, and troubleshooting the Rainscribe system.
 
-## Prerequisites
+## Setup
 
-- Docker and Docker Compose for local development
-- Kubernetes cluster for production deployment
-- Helm for managing Kubernetes deployments
-- Poetry for Python dependency management
-- FFmpeg for audio/video processing
+### Environment Variables
 
-## Local Development with Docker Compose
+Create a `.env` file with the following configuration:
 
-The easiest way to run the complete rainscribe system locally is using Docker Compose.
+```bash
+# Core Configuration
+HLS_STREAM_URL=https://example.com/stream/index.m3u8
+SHARED_VOLUME_PATH=/shared-data
+TRANSCRIPTION_LANGUAGE=ru
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/rainscribe.git
-   cd rainscribe
-   ```
+# Transcription Service
+GLADIA_API_KEY=your_api_key_here  # Required - Get from https://app.gladia.io/
 
-2. Build the Docker images:
-   ```bash
-   make build
-   ```
+# Clock Configuration
+CLOCK_UPDATE_INTERVAL=1800
+CLOCK_MAX_DRIFT=0.1
+CLOCK_STATE_FILE=/shared-data/state/clock_state.json
+CLOCK_SYNC_JITTER=60
 
-3. Start all services:
-   ```bash
-   make up
-   ```
+# Offset Calculation
+OFFSET_WINDOW_SIZE=30
+OFFSET_EMA_ALPHA=0.15
+OFFSET_OUTLIER_THRESHOLD=2.5
+OFFSET_MEDIAN_WEIGHT=0.4
+OFFSET_STATE_FILE=/shared-data/state/offset_state.json
 
-4. View the logs:
-   ```bash
-   make logs
-   ```
+# Segmentation
+WEBVTT_SEGMENT_DURATION=10
+WEBVTT_SEGMENT_OVERLAP=1.0
+WEBVTT_TIME_SOURCE=reference_clock
+HLS_CLOCK_SYNC=true
 
-5. Access the HLS player in your browser:
-   ```
-   http://localhost:8080
-   ```
+# FFmpeg Configuration
+FFMPEG_COPYTS=1
+FFMPEG_START_AT_ZERO=1
+FFMPEG_SEGMENT_DURATION=10
+FFMPEG_MAX_RETRIES=10
+FFMPEG_RETRY_DELAY=5
+```
 
-6. To stop all services:
-   ```bash
-   make down
-   ```
+### Setting up Gladia API Key
 
-## Kubernetes Deployment with Helm
+The transcription service uses Gladia's API for real-time speech-to-text conversion. To use this service:
 
-For production deployment, use Kubernetes with Helm:
+1. Sign up for a Gladia account at https://app.gladia.io/
+2. Once registered, navigate to your dashboard
+3. Generate a new API key or copy your existing API key
+4. Add the API key to your `.env` file as `GLADIA_API_KEY=your_api_key_here`
 
-1. Build and push the Docker images to a registry:
-   ```bash
-   make build-images
-   make push-images
-   ```
+Note: Without a valid Gladia API key, the transcription service will not function, and no subtitles will be generated.
 
-2. Install or upgrade the Helm chart:
-   ```bash
-   make helm-install
-   ```
+### Running with Docker Compose
 
-3. Access the deployed application:
-   The application will be available at the hostname configured in the ingress settings. By default, it's set to `rainscribe.local`. You may need to add this to your /etc/hosts file or configure your DNS accordingly.
+```bash
+docker-compose up -d
+```
 
-4. To uninstall the deployment:
-   ```bash
-   make helm-uninstall
-   ```
+## Tuning Synchronization
 
-## Configuration
+Synchronization between video and subtitles is a critical aspect of Rainscribe. Here's how to tune it:
 
-The system's behavior can be customized by modifying the environment variables in the `.env` file or the values in `helm-chart/values.yaml` for Kubernetes deployment.
+### Clock Synchronization
 
-Key configuration parameters:
+1. **NTP Server Selection:** The reference clock uses NTP servers to synchronize time. By default, it uses `time.google.com`, `pool.ntp.org`, `time.cloudflare.com`, and `time.apple.com`. You can customize these by setting the `NTP_SERVERS` environment variable.
 
-- `GLADIA_API_KEY`: Your Gladia API key for transcription and translation services
-- `HLS_STREAM_URL`: URL of the HLS stream to process
-- `TRANSCRIPTION_LANGUAGE`: Primary language for transcription (default: "ru")
-- `TRANSLATION_LANGUAGES`: Languages to translate to, comma-separated (default: "en,nl")
+2. **Update Interval:** The `CLOCK_UPDATE_INTERVAL` (in seconds) controls how often the reference clock syncs with NTP servers. Lower values provide more frequent updates but may cause more network traffic.
 
-## Architecture
+3. **Drift Monitoring:** The system calculates clock drift over time. If you notice persistent drift, consider reducing the `CLOCK_UPDATE_INTERVAL` to sync more frequently.
 
-rainscribe consists of the following microservices:
+### Offset Calculation
 
-1. **Audio Extractor Service**: Captures the HLS stream and extracts audio
-2. **Transcription & Translation Service**: Uses Gladia API for real-time transcription and translation
-3. **Caption Generator Service**: Converts transcription data into WebVTT subtitle files
-4. **Stream Mirroring Service**: Merges original video with subtitles into a new HLS stream
-5. **NGINX Server**: Hosts the final HLS content and web player
+The offset calculator maintains the timing relationship between audio transcription and video playback:
 
-All services communicate through a shared data volume.
+1. **Window Size:** `OFFSET_WINDOW_SIZE` determines how many recent measurements to use for calculations. Higher values (20-50) provide more stability but slower adaptation to changes.
+
+2. **EMA Smoothing:** `OFFSET_EMA_ALPHA` controls the Exponential Moving Average weight. Values closer to 0 (e.g., 0.05-0.15) provide more smoothing but slower adaptation to changes.
+
+3. **Median Weight:** `OFFSET_MEDIAN_WEIGHT` (0.0-1.0) controls how much importance is given to the median value vs. the EMA. Higher values (0.5-0.7) provide more stability in noisy conditions.
+
+4. **Outlier Rejection:** `OFFSET_OUTLIER_THRESHOLD` determines when to reject measurements as outliers. Values between 2.0-3.0 are typically good, with lower values being more aggressive at rejecting outliers.
+
+### Segment Timing
+
+The WebVTT segmenter and FFmpeg must use consistent segment durations:
+
+1. **Segment Duration:** Ensure `WEBVTT_SEGMENT_DURATION` and `FFMPEG_SEGMENT_DURATION` are identical (10 seconds by default).
+
+2. **Segment Overlap:** `WEBVTT_SEGMENT_OVERLAP` adds a small overlap between WebVTT segments to prevent subtitles at segment boundaries from disappearing. 1.0 seconds is a good default.
+
+3. **HLS Sync:** Setting `HLS_CLOCK_SYNC=true` makes WebVTT segments align precisely with HLS segments using program date time values.
 
 ## Troubleshooting
 
-- **No audio extraction**: Check if the HLS stream URL is accessible
-- **No transcription**: Verify your Gladia API key is valid
-- **Service crashes**: Check the logs with `make logs` for detailed error messages
-- **WebVTT files not generated**: Ensure the shared volume is properly mounted and accessible by all services
+### Subtitle Delay
 
-For more detailed logs, you can view individual service logs:
+If subtitles appear consistently too early or too late:
+
+1. Check the offset calculator metrics by examining `/metrics` endpoints
+2. Look for patterns in the `current_offset` value - it should stabilize after a few minutes
+3. Adjust the `BUFFER_DURATION` if needed - this adds extra delay to account for processing time
+4. Restart the system with a different initial offset value if necessary
+
+### Subtitle Drift
+
+If subtitles start in sync but gradually drift:
+
+1. Check the reference clock metrics to ensure it's not drifting
+2. Verify the FFmpeg process is using `-copyts` and `-start_at_zero` options
+3. Make sure both the caption generator and stream mirroring services use the same segment duration
+4. Look for abnormal latency patterns in the transcription service logs
+
+### Inconsistent Subtitle Format
+
+If subtitles appear with incorrect formatting or timing:
+
+1. Examine the raw WebVTT files in the `/shared-data/webvtt` directory
+2. Check for timestamp formatting issues or overlapping cue times
+3. Adjust `MINIMUM_CUE_DURATION` if subtitles flash too quickly
+4. Verify the player correctly interprets the WebVTT format
+
+### FFmpeg Crashes
+
+If FFmpeg processes crash frequently:
+
+1. Examine logs in `/shared-data/logs`
+2. Consider increasing buffer sizes with `FFMPEG_EXTRA_OPTIONS`
+3. Check for network issues with the input stream
+4. Adjust `FFMPEG_MAX_RETRIES` and `FFMPEG_RETRY_DELAY` for more resilience
+
+## Advanced Configuration
+
+### Redis Integration
+
+For multi-node deployments, you can use Redis to share clock and offset state:
+
 ```bash
-docker-compose logs audio-extractor
-docker-compose logs transcription-service
-docker-compose logs caption-generator
-docker-compose logs stream-mirroring
-docker-compose logs nginx
+USE_REDIS_FOR_CLOCK=true
+USE_REDIS_FOR_OFFSET=true
+REDIS_HOST=redis-service
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_KEY_PREFIX=rainscribe:
 ```
 
-## Support
+### Custom FFmpeg Options
 
-For issues, questions, or contributions, please open an issue on the GitHub repository. 
+You can provide additional FFmpeg options for specific needs:
+
+```bash
+FFMPEG_EXTRA_OPTIONS="-threads 4 -preset ultrafast -tune zerolatency"
+```
+
+### Monitoring
+
+Each service exposes metrics on port 9090 by default:
+
+- Audio Extractor: http://localhost:9091/metrics
+- Transcription Service: http://localhost:9092/metrics
+- Caption Generator: http://localhost:9093/metrics
+- Stream Mirroring: http://localhost:9094/metrics
+
+Set up Prometheus and Grafana to collect and visualize these metrics for production monitoring.
+
+## Testing
+
+To test if subtitles are properly synchronized:
+
+1. Use the `player.html` test page: http://localhost:8080/player.html
+2. Use VLC with the master playlist URL: http://localhost:8080/hls/master.m3u8
+3. Monitor the metrics endpoints to see offset and clock values
+
+## Common Issues
+
+### HLS Stream Not Available
+
+- Check if the input URL is accessible and valid
+- Verify network connectivity from the container
+- Check for any required authentication or headers
+
+### No WebVTT Files Generated
+
+- Verify the transcription service is receiving audio
+- Check for errors in the transcription service logs
+- Make sure the API credentials are correct (if using an external transcription service)
+
+### Player Not Showing Subtitles
+
+- Ensure the player supports HLS with WebVTT subtitles
+- Check that subtitle tracks are properly referenced in the master playlist
+- Try a different player (VLC, hls.js-based players, etc.)
+- Verify that captions are enabled in the player settings 

@@ -1,40 +1,33 @@
 #!/bin/sh
-# Shared Volume Initialization Script for rainscribe
+#
+# Initialization script for shared volume
+#
 
-# Load configuration from environment variables
-SHARED_VOLUME_PATH=${SHARED_VOLUME_PATH:-"/shared-data"}
-TRANSCRIPTION_LANGUAGE=${TRANSCRIPTION_LANGUAGE:-"ru"}
-TRANSLATION_LANGUAGES=${TRANSLATION_LANGUAGES:-"en,nl"}
+set -e
 
-echo "Initializing shared volume at $SHARED_VOLUME_PATH"
+# Get the shared volume path from environment or use default
+SHARED_VOLUME_PATH=${SHARED_VOLUME_PATH:-/shared-data}
 
-# Create main directories
-mkdir -p $SHARED_VOLUME_PATH
-mkdir -p $SHARED_VOLUME_PATH/transcript
-mkdir -p $SHARED_VOLUME_PATH/webvtt
-mkdir -p $SHARED_VOLUME_PATH/hls
+# Create required directories
+mkdir -p ${SHARED_VOLUME_PATH}/audio
+mkdir -p ${SHARED_VOLUME_PATH}/transcript
+mkdir -p ${SHARED_VOLUME_PATH}/webvtt
+mkdir -p ${SHARED_VOLUME_PATH}/hls
+mkdir -p ${SHARED_VOLUME_PATH}/logs
+mkdir -p ${SHARED_VOLUME_PATH}/state
 
-# Create language-specific directories
-echo "Creating directories for language: $TRANSCRIPTION_LANGUAGE"
-mkdir -p $SHARED_VOLUME_PATH/webvtt/$TRANSCRIPTION_LANGUAGE
-mkdir -p $SHARED_VOLUME_PATH/hls/$TRANSCRIPTION_LANGUAGE
+# Create empty README files to document directory purpose
+echo "This directory contains audio files extracted from the input stream." > ${SHARED_VOLUME_PATH}/audio/README.txt
+echo "This directory contains transcript files generated from audio." > ${SHARED_VOLUME_PATH}/transcript/README.txt
+echo "This directory contains WebVTT subtitle files generated from transcripts." > ${SHARED_VOLUME_PATH}/webvtt/README.txt
+echo "This directory contains HLS stream files mirrored from the source." > ${SHARED_VOLUME_PATH}/hls/README.txt
+echo "This directory contains log files from various services." > ${SHARED_VOLUME_PATH}/logs/README.txt
+echo "This directory contains persistent state files for clock and offset synchronization." > ${SHARED_VOLUME_PATH}/state/README.txt
 
-# Process comma-separated languages without array
-echo "$TRANSLATION_LANGUAGES" | tr ',' '\n' | while read lang; do
-    echo "Creating directories for language: $lang"
-    mkdir -p $SHARED_VOLUME_PATH/webvtt/$lang
-    mkdir -p $SHARED_VOLUME_PATH/hls/$lang
-done
+# Ensure directories have proper permissions
+chmod -R 777 ${SHARED_VOLUME_PATH}
 
-# Create a named pipe for audio streaming
-echo "Creating named pipe for audio stream"
-if [ -e "$SHARED_VOLUME_PATH/audio_stream" ]; then
-    rm -f "$SHARED_VOLUME_PATH/audio_stream"
-fi
-mkfifo "$SHARED_VOLUME_PATH/audio_stream"
+echo "Shared volume initialized successfully at ${SHARED_VOLUME_PATH}"
+echo "Created directories: audio, transcript, webvtt, hls, logs, state"
 
-# Set permissions
-echo "Setting permissions"
-chmod -R 777 $SHARED_VOLUME_PATH
-
-echo "Shared volume initialization complete" 
+exit 0 

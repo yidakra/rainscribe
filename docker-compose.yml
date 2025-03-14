@@ -14,6 +14,12 @@ services:
       dockerfile: audio-extractor/Dockerfile
     env_file:
       - .env
+    environment:
+      # Clock configuration
+      - CLOCK_UPDATE_INTERVAL=1800
+      - CLOCK_MAX_DRIFT=0.1
+      - CLOCK_STATE_FILE=/shared-data/state/clock_state.json
+      - CLOCK_SYNC_JITTER=60
     volumes:
       - shared-data:/shared-data
     depends_on:
@@ -28,6 +34,16 @@ services:
       - .env
     environment:
       - TRANSCRIPTION_LANGUAGE=ru
+      # Clock configuration
+      - CLOCK_UPDATE_INTERVAL=1800
+      - CLOCK_MAX_DRIFT=0.1
+      - CLOCK_STATE_FILE=/shared-data/state/clock_state.json
+      # Offset calculation
+      - OFFSET_WINDOW_SIZE=30
+      - OFFSET_EMA_ALPHA=0.15
+      - OFFSET_OUTLIER_THRESHOLD=2.5
+      - OFFSET_MEDIAN_WEIGHT=0.4
+      - OFFSET_STATE_FILE=/shared-data/state/offset_state.json
     volumes:
       - shared-data:/shared-data
     depends_on:
@@ -42,10 +58,26 @@ services:
     env_file:
       - .env
     environment:
+      # Timing parameters
       - BUFFER_DURATION=3
       - OFFSET_ADJUSTMENT_INTERVAL=30
       - DRIFT_THRESHOLD=0.5
       - WEBVTT_SEGMENT_DURATION=10
+      - WEBVTT_SEGMENT_OVERLAP=1.0
+      - WEBVTT_TIME_SOURCE=reference_clock
+      - HLS_CLOCK_SYNC=true
+      - SUBTITLE_DISPLAY_WINDOW=30
+      - MINIMUM_CUE_DURATION=2.0
+      # Clock configuration
+      - CLOCK_UPDATE_INTERVAL=1800
+      - CLOCK_MAX_DRIFT=0.1
+      - CLOCK_STATE_FILE=/shared-data/state/clock_state.json
+      # Offset calculation
+      - OFFSET_WINDOW_SIZE=30
+      - OFFSET_EMA_ALPHA=0.15
+      - OFFSET_OUTLIER_THRESHOLD=2.5
+      - OFFSET_MEDIAN_WEIGHT=0.4
+      - OFFSET_STATE_FILE=/shared-data/state/offset_state.json
     volumes:
       - shared-data:/shared-data
     depends_on:
@@ -61,6 +93,14 @@ services:
       - .env
     environment:
       - WEBVTT_SEGMENT_DURATION=10
+      # Clock configuration
+      - CLOCK_UPDATE_INTERVAL=1800
+      - CLOCK_MAX_DRIFT=0.1
+      - CLOCK_STATE_FILE=/shared-data/state/clock_state.json
+      # Ensure FFmpeg uses consistent parameters
+      - FFMPEG_COPYTS=1
+      - FFMPEG_START_AT_ZERO=1
+      - FFMPEG_SEGMENT_DURATION=10
     volumes:
       - shared-data:/shared-data
     depends_on:
