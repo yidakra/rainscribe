@@ -26,6 +26,8 @@ services:
       dockerfile: transcription-service/Dockerfile
     env_file:
       - .env
+    environment:
+      - TRANSCRIPTION_LANGUAGE=ru
     volumes:
       - shared-data:/shared-data
     depends_on:
@@ -39,6 +41,11 @@ services:
       dockerfile: caption-generator/Dockerfile
     env_file:
       - .env
+    environment:
+      - BUFFER_DURATION=3
+      - OFFSET_ADJUSTMENT_INTERVAL=30
+      - DRIFT_THRESHOLD=0.5
+      - WEBVTT_SEGMENT_DURATION=10
     volumes:
       - shared-data:/shared-data
     depends_on:
@@ -52,6 +59,8 @@ services:
       dockerfile: stream-mirroring/Dockerfile
     env_file:
       - .env
+    environment:
+      - WEBVTT_SEGMENT_DURATION=10
     volumes:
       - shared-data:/shared-data
     depends_on:

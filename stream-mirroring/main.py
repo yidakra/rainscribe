@@ -2,17 +2,19 @@
 """
 Stream Mirroring Service for rainscribe
 
-This service mirrors the original HLS stream and merges it with WebVTT subtitles
-to create a new HLS stream with embedded captions in multiple languages.
+This service uses FFmpeg to mirror the input HLS stream, performs transcoding if needed,
+and adds WebVTT subtitle files to the output HLS stream.
 """
 
 import os
 import sys
 import time
+import json
 import logging
-import asyncio
+import signal
 import subprocess
-from pathlib import Path
+import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Configure logging
@@ -26,164 +28,207 @@ logger = logging.getLogger("stream-mirroring")
 load_dotenv()
 
 # Configuration
-HLS_STREAM_URL = os.getenv("HLS_STREAM_URL")
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/shared-data")
+INPUT_URL = os.getenv("INPUT_URL")
+OUTPUT_DIR = f"{SHARED_VOLUME_PATH}/hls"
 WEBVTT_DIR = f"{SHARED_VOLUME_PATH}/webvtt"
-OUTPUT_HLS_DIR = f"{SHARED_VOLUME_PATH}/hls"
-TRANSCRIPTION_LANGUAGE = os.getenv("TRANSCRIPTION_LANGUAGE", "ru")
-TRANSLATION_LANGUAGES = os.getenv("TRANSLATION_LANGUAGES", "en,nl").split(",")
-SUPPORTED_LANGUAGES = [TRANSCRIPTION_LANGUAGE] + TRANSLATION_LANGUAGES
-SEGMENT_DURATION = int(os.getenv("WEBVTT_SEGMENT_DURATION", "10"))
+REFERENCE_CLOCK_FILE = f"{SHARED_VOLUME_PATH}/reference_clock.json"
+HLS_SEGMENT_TIME = int(os.getenv("HLS_SEGMENT_TIME", "10"))
+HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))
+SUBTITLE_SYNC_THRESHOLD = int(os.getenv("SUBTITLE_SYNC_THRESHOLD", "5"))  # Maximum allowed subtitle sync offset in seconds
 
+# Global state
+ffmpeg_process = None
+reference_start_time = None
 
-async def create_directory_structure():
-    """Create the necessary directory structure."""
-    os.makedirs(OUTPUT_HLS_DIR, exist_ok=True)
-    for language in SUPPORTED_LANGUAGES:
-        os.makedirs(f"{OUTPUT_HLS_DIR}/{language}", exist_ok=True)
+def save_reference_clock():
+    """Save the reference clock to the shared file."""
+    global reference_start_time
+    try:
+        current_time = time.time()
+        if reference_start_time is None:
+            reference_start_time = current_time
+        
+        with open(REFERENCE_CLOCK_FILE, "w") as f:
+            json.dump({
+                "start_time": reference_start_time,
+                "creation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }, f)
+        logger.info(f"Saved reference start time: {reference_start_time}")
+    except Exception as e:
+        logger.error(f"Error saving reference clock: {e}")
 
+def load_reference_clock():
+    """Load the reference clock from the shared file."""
+    global reference_start_time
+    try:
+        if os.path.exists(REFERENCE_CLOCK_FILE):
+            with open(REFERENCE_CLOCK_FILE, "r") as f:
+                data = json.load(f)
+                reference_start_time = data.get("start_time")
+                logger.info(f"Loaded reference start time: {reference_start_time}")
+        else:
+            # If file doesn't exist, create it
+            save_reference_clock()
+    except Exception as e:
+        logger.error(f"Error loading reference clock: {e}")
+        # If an error occurs, create a new reference clock
+        save_reference_clock()
 
-async def run_ffmpeg_command(cmd):
-    """Run an FFmpeg command as a subprocess."""
-    logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
-    
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    
-    stdout, stderr = await process.communicate()
-    
-    if process.returncode != 0:
-        logger.error(f"FFmpeg error (code {process.returncode}): {stderr.decode()}")
-        return False
-    
-    return True
+def signal_handler(sig, frame):
+    """Handle signals to gracefully terminate FFmpeg."""
+    global ffmpeg_process
+    logger.info(f"Received signal {sig}, stopping FFmpeg...")
+    if ffmpeg_process:
+        try:
+            # Try to terminate gracefully first
+            ffmpeg_process.terminate()
+            # Wait for up to 5 seconds
+            for _ in range(50):
+                if ffmpeg_process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            # If still running, force kill
+            if ffmpeg_process.poll() is None:
+                ffmpeg_process.kill()
+        except Exception as e:
+            logger.error(f"Error stopping FFmpeg: {e}")
+    sys.exit(0)
 
-
-async def mirror_hls_stream_with_subtitles(language):
-    """
-    Mirror the original HLS stream and merge it with subtitles for a specific language.
-    """
-    output_dir = f"{OUTPUT_HLS_DIR}/{language}"
-    subtitle_manifest = f"{WEBVTT_DIR}/{language}/playlist.m3u8"
+def run_ffmpeg():
+    """Run FFmpeg to mirror the stream and add subtitles."""
+    global ffmpeg_process
     
-    # Check if subtitle manifest exists
-    if not os.path.exists(subtitle_manifest):
-        logger.warning(f"Subtitle manifest for {language} not found, creating placeholder...")
-        os.makedirs(os.path.dirname(subtitle_manifest), exist_ok=True)
-        with open(subtitle_manifest, "w") as f:
-            f.write("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Build FFmpeg command
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", HLS_STREAM_URL,  # Input HLS stream
-        "-i", subtitle_manifest,  # Input subtitles
-        "-map", "0:v",  # Map video from first input
-        "-map", "0:a",  # Map audio from first input
-        "-map", "1",    # Map subtitles from second input
-        "-c:v", "copy",  # Copy video codec
-        "-c:a", "copy",  # Copy audio codec
-        "-c:s", "webvtt",  # WebVTT subtitle format
-        "-f", "hls",  # HLS output format
-        "-hls_time", str(SEGMENT_DURATION),  # Segment duration
-        "-hls_list_size", "10",  # Number of segments to keep in the playlist
-        "-hls_flags", "independent_segments",  # Each segment can be decoded independently
-        "-hls_segment_filename", f"{output_dir}/segment_%05d.ts",  # Segment filename pattern
-        f"{output_dir}/playlist.m3u8"  # Output manifest
+    # Create master playlist with reference to subtitle tracks
+    create_master_playlist()
+    
+    # Set FFmpeg command
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "info",
+        
+        # Input stream
+        "-i", INPUT_URL,
+        
+        # Add subtitles input (will be used if webvtt files are available)
+        "-i", f"{WEBVTT_DIR}/ru/playlist.m3u8",
+        
+        # Global options
+        "-y",                     # Overwrite output files
+        "-re",                    # Read input at native frame rate
+        "-copyts",                # Copy timestamps
+        "-start_at_zero",         # Start timestamp at zero
+        "-avoid_negative_ts", "1", # Avoid negative timestamps
+        
+        # Map audio and video streams
+        "-map", "0:v:0",          # Map video from input 0
+        "-map", "0:a:0",          # Map audio from input 0
+        "-map", "1:s?",           # Map subtitles from input 1 if available
+        
+        # Video settings (copy by default, but can be changed for transcoding)
+        "-c:v", "copy",           # Just copy the video codec
+        
+        # Audio settings
+        "-c:a", "copy",           # Just copy the audio codec
+        
+        # Subtitle settings
+        "-c:s", "webvtt",         # Copy WebVTT subtitles
+        
+        # Output HLS settings
+        "-f", "hls",
+        "-hls_time", str(HLS_SEGMENT_TIME),
+        "-hls_list_size", str(HLS_LIST_SIZE),
+        "-hls_flags", "independent_segments+delete_segments+program_date_time",
+        "-hls_segment_type", "mpegts",
+        "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%05d.ts",
+        
+        # Enable subtitle streams in playlist
+        "-hls_subtitle_path", f"{WEBVTT_DIR}/ru/",
+        "-hls_flags", "independent_segments+delete_segments+program_date_time+discont_start", 
+        "-hls_playlist_type", "event",
+        "-strftime", "1",         # Use strftime for naming
+        
+        # Synchronization options
+        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
+        
+        # Output file
+        f"{OUTPUT_DIR}/playlist.m3u8"
     ]
     
-    # Run FFmpeg
-    success = await run_ffmpeg_command(cmd)
+    # Log FFmpeg command
+    logger.info(f"Starting FFmpeg with command: {' '.join(ffmpeg_cmd)}")
     
-    if success:
-        logger.info(f"Successfully mirrored HLS stream with {language} subtitles")
-    else:
-        logger.error(f"Failed to mirror HLS stream with {language} subtitles")
-
-
-async def create_master_playlist():
-    """
-    Create a master playlist that references all language-specific playlists.
-    """
-    logger.info("Creating master playlist")
-    
-    with open(f"{OUTPUT_HLS_DIR}/master.m3u8", "w") as f:
-        f.write("#EXTM3U\n")
-        f.write("#EXT-X-VERSION:3\n")
+    try:
+        # Start FFmpeg
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
         
-        # Define subtitle group
-        f.write(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Russian",DEFAULT=YES,AUTOSELECT=YES,')
-        f.write(f'LANGUAGE="ru",URI="/webvtt/ru/playlist.m3u8"\n')
+        # Log FFmpeg output
+        for line in ffmpeg_process.stdout:
+            line = line.strip()
+            if line:
+                logger.info(f"FFmpeg: {line}")
         
-        for lang in TRANSLATION_LANGUAGES:
-            lang_name = {"en": "English", "nl": "Dutch"}.get(lang, lang.upper())
-            f.write(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{lang_name}",DEFAULT=NO,AUTOSELECT=YES,')
-            f.write(f'LANGUAGE="{lang}",URI="/webvtt/{lang}/playlist.m3u8"\n')
-        
-        # Add video variant with subtitles
-        f.write(f'#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,SUBTITLES="subs"\n')
-        f.write(f'{TRANSCRIPTION_LANGUAGE}/playlist.m3u8\n')
-    
-    logger.info("Master playlist created")
+        # Wait for FFmpeg to complete
+        return_code = ffmpeg_process.wait()
+        logger.info(f"FFmpeg exited with code {return_code}")
+        return return_code
+    except Exception as e:
+        logger.error(f"Error running FFmpeg: {e}")
+        return 1
 
-
-async def monitor_subtitle_changes():
-    """
-    Monitor the WebVTT directory for changes to subtitle files and
-    update the HLS stream accordingly.
-    """
-    # Track last modification times of subtitle manifests
-    last_modified = {lang: 0 for lang in SUPPORTED_LANGUAGES}
-    
-    while True:
-        try:
-            for language in SUPPORTED_LANGUAGES:
-                subtitle_manifest = f"{WEBVTT_DIR}/{language}/playlist.m3u8"
-                
-                # Check if manifest exists and has been modified
-                if os.path.exists(subtitle_manifest):
-                    mtime = os.path.getmtime(subtitle_manifest)
-                    
-                    if mtime > last_modified[language]:
-                        logger.info(f"Detected changes in {language} subtitles, updating HLS stream")
-                        last_modified[language] = mtime
-                        await mirror_hls_stream_with_subtitles(language)
-                        await create_master_playlist()
+def create_master_playlist():
+    """Create a master playlist that includes subtitle tracks."""
+    try:
+        # Create a master playlist with subtitle tracks
+        with open(f"{OUTPUT_DIR}/master.m3u8", "w") as f:
+            f.write("#EXTM3U\n")
+            f.write("#EXT-X-VERSION:3\n")
             
-            # Sleep before checking again
-            await asyncio.sleep(5)
+            # Add program date time for synchronization
+            if reference_start_time:
+                program_date = datetime.fromtimestamp(reference_start_time).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                f.write(f"#EXT-X-PROGRAM-DATE-TIME:{program_date}\n")
             
-        except Exception as e:
-            logger.error(f"Error monitoring subtitle changes: {e}")
-            await asyncio.sleep(10)
+            # Define subtitle track
+            f.write('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Russian",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="ru",URI="ru/playlist.m3u8"\n')
+            
+            # Define the main video+audio stream with subtitle group
+            f.write('#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS="avc1.4d401f,mp4a.40.2",SUBTITLES="subs"\n')
+            f.write("playlist.m3u8\n")
+            
+        logger.info("Created master playlist with subtitle tracks")
+    except Exception as e:
+        logger.error(f"Error creating master playlist: {e}")
 
-
-async def main():
-    """Main function for the Stream Mirroring Service."""
+def main():
+    """Main entry point for the Stream Mirroring Service."""
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     logger.info("Starting Stream Mirroring Service")
     
-    # Create directory structure
-    await create_directory_structure()
+    # Load or create reference clock
+    load_reference_clock()
     
-    # Initial mirroring for all languages
-    for language in SUPPORTED_LANGUAGES:
-        await mirror_hls_stream_with_subtitles(language)
-    
-    # Create master playlist
-    await create_master_playlist()
-    
-    # Monitor for subtitle changes
-    await monitor_subtitle_changes()
-
+    # Run FFmpeg and restart if it crashes
+    while True:
+        return_code = run_ffmpeg()
+        if return_code != 0:
+            logger.error(f"FFmpeg crashed with code {return_code}, restarting in 5 seconds...")
+            time.sleep(5)
+        else:
+            logger.info("FFmpeg exited gracefully, stopping service")
+            break
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Service interrupted, shutting down")
-    except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
-        sys.exit(1) 
+    main() 

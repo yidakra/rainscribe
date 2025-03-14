@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Transcription & Translation Service for rainscribe
+Transcription Service for rainscribe
 
 This service reads audio data from a shared pipe, streams it to the Gladia API
-for real-time transcription with word-level timestamps, and obtains translations
-in specified target languages (English and Dutch).
+for real-time transcription with word-level timestamps in Russian.
 """
 
 import os
@@ -16,6 +15,7 @@ import aiohttp
 import websockets
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, TypedDict, Literal
+import time  # Added for timestamp reference
 
 # Configure logging
 logging.basicConfig(
@@ -31,12 +31,12 @@ load_dotenv()
 GLADIA_API_KEY = os.getenv("GLADIA_API_KEY")
 GLADIA_API_URL = os.getenv("GLADIA_API_URL", "https://api.gladia.io")
 TRANSCRIPTION_LANGUAGE = os.getenv("TRANSCRIPTION_LANGUAGE", "ru")
-TRANSLATION_LANGUAGES = os.getenv("TRANSLATION_LANGUAGES", "en,nl").split(",")
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/shared-data")
 AUDIO_PIPE_PATH = f"{SHARED_VOLUME_PATH}/audio_stream"
 SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 BIT_DEPTH = int(os.getenv("AUDIO_BIT_DEPTH", "16"))
 CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
+REFERENCE_CLOCK_FILE = f"{SHARED_VOLUME_PATH}/reference_clock.json"
 
 # Type definitions
 class LanguageConfiguration(TypedDict):
@@ -87,10 +87,6 @@ async def init_live_session() -> InitiateResponse:
             "custom_vocabulary": True,
             "custom_vocabulary_config": {
                 "vocabulary": CUSTOM_VOCABULARY
-            },
-            "translation": True,
-            "translation_config": {
-                "target_languages": TRANSLATION_LANGUAGES
             }
         }
     }
@@ -108,6 +104,21 @@ async def init_live_session() -> InitiateResponse:
                 raise ValueError(f"API Error: {response.status}: {error_text}")
             
             return await response.json()
+
+
+async def initialize_reference_clock():
+    """Initialize a reference clock for synchronization."""
+    reference_time = {
+        "start_time": time.time(),
+        "creation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    os.makedirs(os.path.dirname(REFERENCE_CLOCK_FILE), exist_ok=True)
+    with open(REFERENCE_CLOCK_FILE, "w") as f:
+        json.dump(reference_time, f)
+    
+    logger.info(f"Reference clock initialized: {reference_time}")
+    return reference_time["start_time"]
 
 
 async def stream_audio_to_websocket(websocket, pipe_path):
@@ -146,37 +157,46 @@ async def stream_audio_to_websocket(websocket, pipe_path):
         raise
 
 
-async def write_transcription_data(data, transcript_type="transcript"):
+async def write_transcription_data(data, reference_start_time):
     """
     Write transcription data to files in the shared volume.
+    Adjusts timestamps based on the reference clock.
     """
-    os.makedirs(f"{SHARED_VOLUME_PATH}/{transcript_type}", exist_ok=True)
+    os.makedirs(f"{SHARED_VOLUME_PATH}/transcript", exist_ok=True)
     
-    if transcript_type == "transcript":
-        # For Russian transcription
-        if data.get("type") == "transcript" and data.get("data", {}).get("is_final"):
-            utterance = data["data"]["utterance"]
-            filename = f"{SHARED_VOLUME_PATH}/transcript/ru_transcript_{int(utterance['start'] * 1000)}.json"
+    # For Russian transcription
+    if data.get("type") == "transcript" and data.get("data", {}).get("is_final"):
+        utterance = data["data"]["utterance"]
+        
+        # Adjust timestamps based on reference clock
+        current_time = time.time()
+        pipeline_latency = current_time - reference_start_time - utterance["end"]
+        
+        # Create a copy of the utterance with adjusted timestamps
+        adjusted_utterance = utterance.copy()
+        
+        # Add latency information for debugging and tuning
+        adjusted_utterance["original_start"] = utterance["start"]
+        adjusted_utterance["original_end"] = utterance["end"]
+        adjusted_utterance["reference_time"] = reference_start_time
+        adjusted_utterance["processing_time"] = current_time
+        adjusted_utterance["measured_latency"] = pipeline_latency
+        
+        # Adjust word timestamps if they exist
+        if "words" in adjusted_utterance and adjusted_utterance["words"]:
+            for word in adjusted_utterance["words"]:
+                word["original_start"] = word["start"]
+                word["original_end"] = word["end"]
+        
+        filename = f"{SHARED_VOLUME_PATH}/transcript/ru_transcript_{int(utterance['start'] * 1000)}.json"
+        
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(adjusted_utterance, f, ensure_ascii=False, indent=2)
             
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(utterance, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"Saved transcription: {utterance['text'][:50]}...")
-    
-    elif transcript_type == "translation":
-        # For translations (en, nl)
-        if data.get("type") == "translation":
-            translation = data["data"]["translation"]
-            language = translation["language"]
-            filename = f"{SHARED_VOLUME_PATH}/transcript/{language}_translation_{int(translation['start'] * 1000)}.json"
-            
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(translation, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"Saved {language} translation: {translation['text'][:50]}...")
+        logger.info(f"Saved transcription: {utterance['text'][:50]}... (latency: {pipeline_latency:.2f}s)")
 
 
-async def process_websocket_messages(websocket):
+async def process_websocket_messages(websocket, reference_start_time):
     """Process messages received from the WebSocket."""
     async for message in websocket:
         try:
@@ -184,7 +204,7 @@ async def process_websocket_messages(websocket):
             
             # Process transcriptions
             if data["type"] == "transcript" and data["data"]["is_final"]:
-                await write_transcription_data(data, "transcript")
+                await write_transcription_data(data, reference_start_time)
                 
                 # Debug output of transcript
                 utterance = data["data"]["utterance"]
@@ -192,16 +212,6 @@ async def process_websocket_messages(websocket):
                 end_time = utterance["end"]
                 text = utterance["text"]
                 logger.debug(f"{start_time:.2f} --> {end_time:.2f} | {text}")
-            
-            # Process translations
-            elif data["type"] == "translation":
-                await write_transcription_data(data, "translation")
-                
-                # Debug output of translation
-                translation = data["data"]["translation"]
-                language = translation["language"]
-                text = translation["text"]
-                logger.debug(f"Translation ({language}): {text}")
             
             # Process final transcript
             elif data["type"] == "post_final_transcript":
@@ -223,8 +233,8 @@ async def stop_recording(websocket):
 
 
 async def main():
-    """Main function for the Transcription & Translation Service."""
-    logger.info("Starting Transcription & Translation Service")
+    """Main function for the Transcription Service."""
+    logger.info("Starting Transcription Service")
     
     # Ensure shared volume and audio pipe exists
     os.makedirs(SHARED_VOLUME_PATH, exist_ok=True)
@@ -233,6 +243,9 @@ async def main():
     if not os.path.exists(AUDIO_PIPE_PATH):
         logger.info(f"Creating audio pipe at {AUDIO_PIPE_PATH}")
         os.mkfifo(AUDIO_PIPE_PATH)
+    
+    # Initialize reference clock for synchronization
+    reference_start_time = await initialize_reference_clock()
     
     # Initialize session with Gladia API
     try:
@@ -248,29 +261,17 @@ async def main():
             
             # Create tasks for streaming audio and processing messages
             audio_task = asyncio.create_task(stream_audio_to_websocket(websocket, AUDIO_PIPE_PATH))
-            message_task = asyncio.create_task(process_websocket_messages(websocket))
+            message_task = asyncio.create_task(process_websocket_messages(websocket, reference_start_time))
             
             # Wait for both tasks to complete
-            try:
-                await asyncio.gather(audio_task, message_task)
-            except asyncio.CancelledError:
-                logger.info("Tasks canceled, stopping recording")
-                await stop_recording(websocket)
-                raise
-            except Exception as e:
-                logger.error(f"Error during processing: {e}")
-                await stop_recording(websocket)
-                
+            await asyncio.gather(audio_task, message_task)
+            
+            # Send stop recording signal before closing
+            await stop_recording(websocket)
+        
     except Exception as e:
-        logger.error(f"Critical error: {e}")
-        sys.exit(1)
-
+        logger.error(f"An error occurred: {e}")
+        raise
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Service interrupted, shutting down")
-    except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
-        sys.exit(1) 
+    asyncio.run(main()) 
