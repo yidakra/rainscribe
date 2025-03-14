@@ -10,19 +10,20 @@ import os
 import sys
 import json
 import asyncio
-import logging
 import aiohttp
 import websockets
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, TypedDict, Literal
 import time  # Added for timestamp reference
 
+# Import shared modules
+from shared.reference_clock import get_global_clock, get_time, get_formatted_time
+from shared.offset_calculator import get_global_calculator, add_measurement, get_current_offset
+from shared.logging_config import configure_logging
+from shared.monitoring import get_metrics_manager
+
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("transcription-service")
+logger = configure_logging("transcription-service")
 
 # Load environment variables
 load_dotenv()
@@ -36,7 +37,10 @@ AUDIO_PIPE_PATH = f"{SHARED_VOLUME_PATH}/audio_stream"
 SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 BIT_DEPTH = int(os.getenv("AUDIO_BIT_DEPTH", "16"))
 CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
-REFERENCE_CLOCK_FILE = f"{SHARED_VOLUME_PATH}/reference_clock.json"
+
+# Get metrics manager
+metrics_manager = get_metrics_manager()
+sync_metrics = metrics_manager.sync
 
 # Type definitions
 class LanguageConfiguration(TypedDict):
@@ -91,34 +95,32 @@ async def init_live_session() -> InitiateResponse:
         }
     }
 
-    # Initialize session with Gladia API
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{GLADIA_API_URL}/v2/live",
-            headers={"X-Gladia-Key": GLADIA_API_KEY},
-            json=config,
-            timeout=15,
-        ) as response:
-            if response.status != 201:
-                error_text = await response.text()
-                raise ValueError(f"API Error: {response.status}: {error_text}")
-            
-            return await response.json()
-
-
-async def initialize_reference_clock():
-    """Initialize a reference clock for synchronization."""
-    reference_time = {
-        "start_time": time.time(),
-        "creation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    os.makedirs(os.path.dirname(REFERENCE_CLOCK_FILE), exist_ok=True)
-    with open(REFERENCE_CLOCK_FILE, "w") as f:
-        json.dump(reference_time, f)
-    
-    logger.info(f"Reference clock initialized: {reference_time}")
-    return reference_time["start_time"]
+    try:
+        # Initialize session with Gladia API
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{GLADIA_API_URL}/v2/live",
+                headers={"X-Gladia-Key": GLADIA_API_KEY},
+                json=config,
+                timeout=15,
+            ) as response:
+                if response.status != 201:
+                    error_text = await response.text()
+                    sync_metrics.record_error("api_initialization_error")
+                    raise ValueError(f"API Error: {response.status}: {error_text}")
+                
+                response_data = await response.json()
+                
+                # Record API connection time
+                api_init_time = time.time() - start_time
+                sync_metrics.record_processing_time(api_init_time, "api_initialization")
+                
+                return response_data
+    except Exception as e:
+        logger.error(f"Failed to initialize API session: {e}")
+        sync_metrics.record_error("api_connection_error")
+        raise
 
 
 async def stream_audio_to_websocket(websocket, pipe_path):
@@ -137,6 +139,8 @@ async def stream_audio_to_websocket(websocket, pipe_path):
         # Open the pipe for reading
         with open(pipe_path, "rb") as audio_pipe:
             logger.info("Started streaming audio to Gladia API")
+            chunks_sent = 0
+            bytes_sent = 0
             
             while True:
                 # Read a chunk of audio data
@@ -149,11 +153,19 @@ async def stream_audio_to_websocket(websocket, pipe_path):
                 # Send the chunk to the WebSocket
                 await websocket.send(chunk)
                 
+                # Track metrics
+                chunks_sent += 1
+                bytes_sent += len(chunk)
+                if chunks_sent % 50 == 0:  # Update metrics every ~5 seconds
+                    sync_metrics.metrics.add_metric("audio_chunks_sent", chunks_sent)
+                    sync_metrics.metrics.add_metric("audio_bytes_sent", bytes_sent)
+                
                 # Small delay to prevent overwhelming the socket
                 await asyncio.sleep(0.1)
     
     except Exception as e:
         logger.error(f"Error streaming audio: {e}")
+        sync_metrics.record_error("audio_streaming_error")
         raise
 
 
@@ -169,8 +181,11 @@ async def write_transcription_data(data, reference_start_time):
         utterance = data["data"]["utterance"]
         
         # Adjust timestamps based on reference clock
-        current_time = time.time()
+        current_time = get_time()
         pipeline_latency = current_time - reference_start_time - utterance["end"]
+        
+        # Add the measurement to the global offset calculator
+        add_measurement(pipeline_latency)
         
         # Create a copy of the utterance with adjusted timestamps
         adjusted_utterance = utterance.copy()
@@ -193,18 +208,32 @@ async def write_transcription_data(data, reference_start_time):
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(adjusted_utterance, f, ensure_ascii=False, indent=2)
             
+        # Record metrics
+        sync_metrics.record_latency(pipeline_latency, "pipeline")
+        sync_metrics.record_processing_time(utterance["end"] - utterance["start"], "utterance_duration")
+        
         logger.info(f"Saved transcription: {utterance['text'][:50]}... (latency: {pipeline_latency:.2f}s)")
 
 
 async def process_websocket_messages(websocket, reference_start_time):
     """Process messages received from the WebSocket."""
+    messages_processed = 0
+    transcripts_received = 0
+    
     async for message in websocket:
         try:
+            messages_processed += 1
             data = json.loads(message)
             
             # Process transcriptions
             if data["type"] == "transcript" and data["data"]["is_final"]:
+                transcripts_received += 1
                 await write_transcription_data(data, reference_start_time)
+                
+                # Track metrics
+                if transcripts_received % 10 == 0:
+                    sync_metrics.metrics.add_metric("transcripts_received", transcripts_received)
+                    sync_metrics.metrics.add_metric("messages_processed", messages_processed)
                 
                 # Debug output of transcript
                 utterance = data["data"]["utterance"]
@@ -219,8 +248,10 @@ async def process_websocket_messages(websocket, reference_start_time):
                 
         except json.JSONDecodeError:
             logger.error("Failed to decode JSON message")
+            sync_metrics.record_error("json_decode_error")
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            sync_metrics.record_error("message_processing_error")
 
 
 async def stop_recording(websocket):
@@ -230,6 +261,35 @@ async def stop_recording(websocket):
         logger.info("Sent stop_recording signal")
     except Exception as e:
         logger.error(f"Error stopping recording: {e}")
+        sync_metrics.record_error("stop_recording_error")
+
+
+async def health_check():
+    """Periodically check system health and update metrics."""
+    while True:
+        try:
+            # Check the offset calculator status
+            offset_stats = get_global_calculator().get_stats()
+            for key, value in offset_stats.items():
+                if isinstance(value, (int, float)):
+                    sync_metrics.metrics.add_metric(f"offset_calculator.{key}", value)
+            
+            # Check the reference clock status
+            clock_status = get_global_clock().get_status()
+            for key, value in clock_status.items():
+                if isinstance(value, (int, float)) and key not in ["current_system_time", "current_reference_time"]:
+                    sync_metrics.metrics.add_metric(f"reference_clock.{key}", value)
+            
+            # Report service as healthy
+            sync_metrics.record_health_check("transcription_service", True)
+            
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+            sync_metrics.record_health_check("transcription_service", False)
+            sync_metrics.record_error("health_check_error")
+        
+        # Run health check every 30 seconds
+        await asyncio.sleep(30)
 
 
 async def main():
@@ -244,10 +304,16 @@ async def main():
         logger.info(f"Creating audio pipe at {AUDIO_PIPE_PATH}")
         os.mkfifo(AUDIO_PIPE_PATH)
     
-    # Initialize reference clock for synchronization
-    reference_start_time = await initialize_reference_clock()
+    # Start the metrics manager
+    metrics_manager.start_auto_save()
     
-    # Initialize session with Gladia API
+    # Initialize the global reference clock
+    reference_clock = get_global_clock()
+    reference_clock.sync_once()  # Synchronize with NTP servers
+    reference_start_time = reference_clock.get_time()
+    
+    logger.info(f"Reference clock initialized: {get_formatted_time()}")
+    
     try:
         logger.info("Initializing Gladia API session")
         response = await init_live_session()
@@ -259,18 +325,20 @@ async def main():
         async with websockets.connect(websocket_url) as websocket:
             logger.info("Connected to Gladia WebSocket")
             
-            # Create tasks for streaming audio and processing messages
+            # Create tasks for streaming audio, processing messages, and health checks
             audio_task = asyncio.create_task(stream_audio_to_websocket(websocket, AUDIO_PIPE_PATH))
             message_task = asyncio.create_task(process_websocket_messages(websocket, reference_start_time))
+            health_task = asyncio.create_task(health_check())
             
-            # Wait for both tasks to complete
-            await asyncio.gather(audio_task, message_task)
+            # Wait for tasks to complete
+            await asyncio.gather(audio_task, message_task, health_task)
             
             # Send stop recording signal before closing
             await stop_recording(websocket)
         
     except Exception as e:
         logger.error(f"An error occurred: {e}")
+        sync_metrics.record_error("service_error")
         raise
 
 if __name__ == "__main__":
