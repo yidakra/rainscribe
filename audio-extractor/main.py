@@ -10,17 +10,18 @@ that can be consumed by the Transcription & Translation Service.
 import os
 import sys
 import asyncio
-import logging
 import subprocess
 import ffmpeg
 from dotenv import load_dotenv
+import time
+
+# Import shared modules
+from shared.reference_clock import get_global_clock, get_time, get_formatted_time
+from shared.logging_config import configure_logging
+from shared.monitoring import get_metrics_manager
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("audio-extractor")
+logger = configure_logging("audio-extractor")
 
 # Load environment variables
 load_dotenv()
@@ -32,6 +33,10 @@ BIT_DEPTH = int(os.getenv("AUDIO_BIT_DEPTH", "16"))
 CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/shared-data")
 AUDIO_PIPE_PATH = f"{SHARED_VOLUME_PATH}/audio_stream"
+
+# Get metrics manager
+metrics_manager = get_metrics_manager()
+sync_metrics = metrics_manager.sync
 
 async def extract_audio():
     """
@@ -47,6 +52,10 @@ async def extract_audio():
     
     logger.info(f"Starting audio extraction from {HLS_STREAM_URL}")
     logger.info(f"Audio format: {SAMPLE_RATE}Hz, {BIT_DEPTH}-bit, {CHANNELS} channel(s)")
+    
+    # Record start time for metrics
+    start_time = get_time()
+    sync_metrics.metrics.add_metric("extraction_start_time", start_time)
     
     try:
         # Build FFmpeg command
@@ -69,6 +78,7 @@ async def extract_audio():
         )
         
         logger.info("Audio extraction process started")
+        sync_metrics.record_health_check("ffmpeg_running", True)
         
         # Wait for the process to complete
         stdout, stderr = await process.communicate()
@@ -76,10 +86,14 @@ async def extract_audio():
         # Log any errors
         if process.returncode != 0:
             logger.error(f"FFmpeg error: {stderr.decode()}")
+            sync_metrics.record_error("ffmpeg_error")
+            sync_metrics.record_health_check("ffmpeg_running", False)
             return
             
     except Exception as e:
         logger.error(f"Error extracting audio: {e}")
+        sync_metrics.record_error("extraction_error")
+        sync_metrics.record_health_check("ffmpeg_running", False)
         sys.exit(1)
 
 async def health_check():
@@ -93,6 +107,7 @@ async def health_check():
             if not os.path.exists(AUDIO_PIPE_PATH):
                 logger.warning("Audio pipe not found, recreating...")
                 os.mkfifo(AUDIO_PIPE_PATH)
+                sync_metrics.record_error("pipe_missing")
             
             # Check if any ffmpeg processes are running
             result = subprocess.run(
@@ -101,12 +116,31 @@ async def health_check():
                 stderr=subprocess.PIPE
             )
             
-            if result.returncode != 0:
+            ffmpeg_running = result.returncode == 0
+            sync_metrics.record_health_check("ffmpeg_process", ffmpeg_running)
+            
+            if not ffmpeg_running:
                 logger.warning("FFmpeg process not running, restarting extraction...")
+                sync_metrics.record_error("ffmpeg_not_running")
                 asyncio.create_task(extract_audio())
+            
+            # Record system clock and reference clock time
+            system_time = time.time()
+            reference_time = get_time()
+            sync_metrics.metrics.add_metric("system_time", system_time)
+            sync_metrics.metrics.add_metric("reference_time", reference_time)
+            
+            # Record offset between system and reference clock
+            clock_offset = reference_time - system_time
+            sync_metrics.metrics.add_metric("clock_offset", clock_offset)
+            
+            # Record service as healthy
+            sync_metrics.record_health_check("audio_extractor_service", True)
                 
         except Exception as e:
             logger.error(f"Health check error: {e}")
+            sync_metrics.record_error("health_check_error")
+            sync_metrics.record_health_check("audio_extractor_service", False)
             
         # Check every 30 seconds
         await asyncio.sleep(30)
@@ -116,6 +150,14 @@ async def main():
     Main entry point for the Audio Extractor Service.
     """
     logger.info("Starting Audio Extractor Service")
+    
+    # Initialize the reference clock
+    reference_clock = get_global_clock()
+    reference_clock.sync_once()  # Synchronize with NTP servers
+    logger.info(f"Reference clock initialized: {get_formatted_time()}")
+    
+    # Start the metrics manager
+    metrics_manager.start_auto_save()
     
     # Start the initial audio extraction process
     extraction_task = asyncio.create_task(extract_audio())

@@ -10,18 +10,20 @@ import os
 import sys
 import json
 import time
-import logging
 import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Any
 
+# Import shared modules
+from shared.webvtt_segmenter import WebVTTSegmenter, WebVTTCue, parse_vtt_content, format_timestamp
+from shared.reference_clock import get_global_clock, get_time, get_formatted_time
+from shared.offset_calculator import get_global_calculator, add_measurement, get_current_offset
+from shared.logging_config import configure_logging
+from shared.monitoring import get_metrics_manager
+
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("caption-generator")
+logger = configure_logging("caption-generator")
 
 # Load environment variables
 load_dotenv()
@@ -30,7 +32,6 @@ load_dotenv()
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/shared-data")
 TRANSCRIPT_DIR = f"{SHARED_VOLUME_PATH}/transcript"
 WEBVTT_DIR = f"{SHARED_VOLUME_PATH}/webvtt"
-REFERENCE_CLOCK_FILE = f"{SHARED_VOLUME_PATH}/reference_clock.json"
 SEGMENT_DURATION = int(os.getenv("WEBVTT_SEGMENT_DURATION", "10"))
 BUFFER_DURATION = int(os.getenv("BUFFER_DURATION", "3"))  # Buffer duration in seconds
 OFFSET_ADJUSTMENT_INTERVAL = int(os.getenv("OFFSET_ADJUSTMENT_INTERVAL", "30"))  # Check for drift every 30 seconds
@@ -38,20 +39,14 @@ DRIFT_THRESHOLD = float(os.getenv("DRIFT_THRESHOLD", "0.5"))  # Drift threshold 
 SUBTITLE_DISPLAY_WINDOW = int(os.getenv("SUBTITLE_DISPLAY_WINDOW", "30"))  # Keep subtitles active for 30 seconds
 MINIMUM_CUE_DURATION = float(os.getenv("MINIMUM_CUE_DURATION", "2.0"))  # Ensure cues stay visible for at least 2 seconds
 
+# Get metrics manager for monitoring
+metrics_manager = get_metrics_manager()
+sync_metrics = metrics_manager.sync
+
 # Global state
-current_offset = 0.0  # Initial latency offset
-reference_start_time = None
 video_start_time = None  # Estimated start time of the video stream
 recent_cues = []  # Maintain a list of recent cues
-
-def format_timestamp(seconds: float) -> str:
-    """Format a timestamp in seconds to WebVTT format (HH:MM:SS.mmm)."""
-    # Ensure no negative timestamps
-    seconds = max(0, seconds)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    milliseconds = int((seconds - int(seconds)) * 1000)
-    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}.{milliseconds:03d}"
+vtt_segmenter = None  # Will be initialized in main()
 
 def create_webvtt_header() -> str:
     """Create the WebVTT header."""
@@ -66,23 +61,6 @@ def create_webvtt_cue(start: float, end: float, text: str, cue_id: int = None) -
     cue += f"{text}\n\n"
     return cue
 
-def load_reference_clock() -> float:
-    """Load the reference clock from the shared file."""
-    try:
-        if os.path.exists(REFERENCE_CLOCK_FILE):
-            with open(REFERENCE_CLOCK_FILE, "r") as f:
-                data = json.load(f)
-                return data.get("start_time", time.time())
-        else:
-            logger.warning("Reference clock file not found, creating a new one")
-            start_time = time.time()
-            with open(REFERENCE_CLOCK_FILE, "w") as f:
-                json.dump({"start_time": start_time, "creation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
-            return start_time
-    except Exception as e:
-        logger.error(f"Error loading reference clock: {e}")
-        return time.time()
-
 async def adjust_timestamps(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Adjust the timestamps in the transcription data based on the current offset.
@@ -94,13 +72,17 @@ async def adjust_timestamps(data: Dict[str, Any]) -> Dict[str, Any]:
     # Make a copy to avoid modifying the original
     adjusted_data = data.copy()
     
+    # Get current offset from the global calculator
+    current_offset = get_current_offset()
+    
     # Calculate video_start_time if not already set
-    if video_start_time is None and reference_start_time is not None:
+    if video_start_time is None:
+        reference_start_time = get_global_clock().get_time()
         video_start_time = reference_start_time - current_offset
         logger.info(f"Estimated video start time: {datetime.fromtimestamp(video_start_time).strftime('%Y-%m-%d %H:%M:%S.%f')}")
     
     # For relative time calculation
-    current_video_time = time.time() - (current_offset if video_start_time is None else (time.time() - video_start_time))
+    current_video_time = get_time() - (current_offset if video_start_time is None else (get_time() - video_start_time))
     
     # Apply the current offset to adjust for drift
     if "original_start" in data and "original_end" in data:
@@ -133,13 +115,19 @@ async def adjust_timestamps(data: Dict[str, Any]) -> Dict[str, Any]:
     logger.debug(f"Adjusted timestamp: original={data.get('original_start', data.get('start', 0)):.2f}, " +
                 f"adjusted={adjusted_data['start']:.2f}, current_offset={current_offset:.2f}")
     
+    # Record metrics for monitoring
+    sync_metrics.record_offset(current_offset, "caption_generator")
+    
     return adjusted_data
 
 async def process_transcript_file(file_path: str):
     """Process a transcript file and update the WebVTT file."""
-    global current_offset, recent_cues
+    global recent_cues, vtt_segmenter
     
     try:
+        # Record start time for performance metrics
+        start_time = time.time()
+        
         # Read the transcript file
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -157,17 +145,23 @@ async def process_transcript_file(file_path: str):
         
         # Extract the necessary information
         text = adjusted_data.get("text", "")
-        start_time = adjusted_data.get("start", 0)
-        end_time = adjusted_data.get("end", start_time + 5)  # Default to 5 seconds if end is not provided
+        start_time_sec = adjusted_data.get("start", 0)
+        end_time_sec = adjusted_data.get("end", start_time_sec + 5)  # Default to 5 seconds if end is not provided
         
-        # For word-level timestamps (also adjusted)
-        words = adjusted_data.get("words", [])
+        # Create a WebVTT cue and add it to the segmenter
+        cue = WebVTTCue(
+            cue_id=f"cue{int(start_time_sec * 1000)}",
+            start_time=start_time_sec,
+            end_time=end_time_sec,
+            text=text
+        )
+        vtt_segmenter.add_cue(cue)
         
         # Store this cue in our recent cues list
         cue_data = {
             "text": text,
-            "start": start_time,
-            "end": end_time,
+            "start": start_time_sec,
+            "end": end_time_sec,
             "file_path": file_path,
             "timestamp": current_time
         }
@@ -176,158 +170,58 @@ async def process_transcript_file(file_path: str):
         recent_cues.append(cue_data)
         recent_cues = [cue for cue in recent_cues if (current_time - cue["timestamp"]) < SUBTITLE_DISPLAY_WINDOW]
         
-        # Create multiple segment files for this cue to ensure it appears in the right window
-        # This helps keep subtitles visible longer and improves synchronization
-        current_segment_index = int((current_time - reference_start_time) / SEGMENT_DURATION)
+        # Calculate current segment index based on reference time
+        current_segment_index = vtt_segmenter.get_segment_for_time(get_time())
         
-        # Create a window of segment files to ensure the subtitle is visible
-        for window_offset in range(-1, 3):  # Create segments from current-1 to current+2
-            segment_index = max(0, current_segment_index + window_offset)
-            segment_file = f"{WEBVTT_DIR}/ru/segment_{segment_index:05d}.vtt"
-            
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(segment_file), exist_ok=True)
-            
-            # Create or rewrite the WebVTT file
-            # We'll rewrite the entire file to ensure proper formatting
-            cues = []
-            
-            # If the file exists, read existing cues
-            if os.path.exists(segment_file):
-                with open(segment_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    # Skip header
-                    if content.startswith("WEBVTT"):
-                        parts = content.split("\n\n")
-                        # First part is header, skip it
-                        for part in parts[1:]:
-                            if part.strip():  # Skip empty parts
-                                cues.append(part)
-            
-            # Prepare the new cue
-            adjusted_start = start_time + (window_offset * SEGMENT_DURATION)
-            adjusted_end = end_time + (window_offset * SEGMENT_DURATION)
-            
-            cue_id = f"cue{int(start_time * 1000)}"  # Use timestamp as cue ID with prefix
-            cue_text = create_webvtt_cue(adjusted_start, adjusted_end, text, cue_id).strip()
-            
-            # Check if we already have this cue (based on cue_id)
-            existing_cue_index = -1
-            for i, cue in enumerate(cues):
-                if cue_id in cue:
-                    existing_cue_index = i
-                    break
-            
-            # Replace or append the cue
-            if existing_cue_index >= 0:
-                cues[existing_cue_index] = cue_text
-            else:
-                cues.append(cue_text)
-            
-            # Write back the file with header and all cues
-            with open(segment_file, "w", encoding="utf-8") as f:
-                f.write(create_webvtt_header())
-                for cue in cues:
-                    f.write(cue + "\n\n")
-            
-            if window_offset == 0:
-                logger.info(f"Updated {segment_file} with cue: {text[:50]}... (offset: {current_offset:.2f}s)")
+        # Generate segment files for a window around the current time
+        # This ensures the subtitle appears at the right time and stays visible appropriately
+        window_range = 3  # Generate segments for current-1 to current+2
+        vtt_segmenter.generate_all_segments(
+            start_index=max(0, current_segment_index - 1),
+            end_index=current_segment_index + 2,
+            output_dir=f"{WEBVTT_DIR}/ru",
+            filename_template="segment_%05d.vtt"
+        )
         
         # Update the HLS manifest for subtitles
-        await update_hls_manifest()
+        playlist_path = f"{WEBVTT_DIR}/ru/playlist.m3u8"
+        vtt_segmenter.generate_playlist(
+            start_index=max(0, current_segment_index - 5),  # Include some past segments
+            end_index=current_segment_index + 10,  # And future segments
+            output_path=playlist_path,
+            segment_template="segment_%05d.vtt"
+        )
         
         # Update offset based on measured latency if provided
         if "measured_latency" in data:
             measured_latency = data["measured_latency"]
             logger.debug(f"Transcript reported measured latency: {measured_latency:.2f}s")
+            
+            # Add the measurement to the global offset calculator
+            add_measurement(measured_latency)
+            
+            # Record metrics
+            sync_metrics.record_latency(measured_latency, "transcript")
         
+        # Record processing time for performance metrics
+        processing_time = time.time() - start_time
+        sync_metrics.record_processing_time(processing_time, "process_transcript")
+        
+        logger.info(f"Processed transcript: {text[:50]}... (offset: {get_current_offset():.2f}s)")
         return True  # Indicate file was processed
         
     except Exception as e:
         logger.error(f"Error processing transcript file {file_path}: {e}")
         logger.exception(e)
+        sync_metrics.record_error("process_transcript_error")
         return False
-
-async def update_hls_manifest():
-    """Update the HLS manifest for Russian subtitles."""
-    try:
-        # Path to the manifest
-        manifest_path = f"{WEBVTT_DIR}/ru/playlist.m3u8"
-        
-        # Ensure the directory exists
-        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-        
-        # Find all segment files
-        segment_files = []
-        if os.path.exists(f"{WEBVTT_DIR}/ru"):
-            segment_files = sorted([
-                f for f in os.listdir(f"{WEBVTT_DIR}/ru")
-                if f.startswith("segment_") and f.endswith(".vtt")
-            ])
-        
-        # Calculate current segment index based on reference time
-        current_time = time.time()
-        current_segment_index = int((current_time - reference_start_time) / SEGMENT_DURATION)
-        
-        # Only include segments that are relevant to current playback
-        # Keep a window of past and future segments to ensure smooth playback
-        relevant_segment_files = []
-        for segment_file in segment_files:
-            try:
-                segment_index = int(segment_file.split("_")[1].split(".")[0])
-                # Keep segments that are within a reasonable window of the current playback time
-                if current_segment_index - 10 <= segment_index <= current_segment_index + 10:
-                    relevant_segment_files.append(segment_file)
-            except (ValueError, IndexError):
-                # Skip files with invalid naming
-                continue
-        
-        # Create the manifest file
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            # Write the header
-            f.write("#EXTM3U\n")
-            f.write("#EXT-X-VERSION:3\n")
-            f.write(f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n")
-            f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
-            
-            # Calculate the program date time for synchronization
-            if reference_start_time:
-                program_date = datetime.fromtimestamp(reference_start_time).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                f.write(f"#EXT-X-PROGRAM-DATE-TIME:{program_date}\n")
-            
-            # Write segment info for relevant segments
-            for segment_file in relevant_segment_files:
-                try:
-                    segment_index = int(segment_file.split("_")[1].split(".")[0])
-                    segment_duration = SEGMENT_DURATION
-                    
-                    # Add program date time to each segment for precise synchronization
-                    if reference_start_time:
-                        segment_start_time = reference_start_time + (segment_index * SEGMENT_DURATION)
-                        segment_date = datetime.fromtimestamp(segment_start_time).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                        f.write(f"#EXT-X-PROGRAM-DATE-TIME:{segment_date}\n")
-                    
-                    f.write(f"#EXTINF:{segment_duration:.3f},\n")
-                    f.write(f"{segment_file}\n")
-                except (ValueError, IndexError):
-                    # Skip files with invalid naming
-                    continue
-            
-            # Don't add endlist for live streams
-            # f.write("#EXT-X-ENDLIST\n")
-            
-        logger.debug(f"Updated HLS manifest with {len(relevant_segment_files)} segments")
-        
-    except Exception as e:
-        logger.error(f"Error updating HLS manifest: {e}")
-        logger.exception(e)
 
 async def update_latency_offset():
     """
     Periodically update the latency offset based on recent transcription data.
     This helps compensate for drift between audio and subtitles.
     """
-    global current_offset, reference_start_time, video_start_time
+    global video_start_time
     
     while True:
         try:
@@ -359,25 +253,33 @@ async def update_latency_offset():
                 
                 if count > 0:
                     avg_latency = total_latency / count
+                    current_offset = get_current_offset()
                     drift = avg_latency - current_offset
+                    
+                    # Record drift metrics
+                    sync_metrics.record_offset(current_offset, "before_adjustment")
+                    sync_metrics.record_offset(avg_latency, "measured")
                     
                     # Adjust offset if drift exceeds threshold
                     if abs(drift) > DRIFT_THRESHOLD:
-                        # Use a weighted adjustment to avoid sudden changes
-                        new_offset = current_offset + (drift * 0.3)  # 30% adjustment
-                        logger.info(f"Adjusting offset from {current_offset:.2f}s to {new_offset:.2f}s (drift: {drift:.2f}s)")
-                        current_offset = new_offset
+                        # Add the latest measurement to the global offset calculator
+                        add_measurement(avg_latency)
+                        
+                        # Log the adjustment
+                        new_offset = get_current_offset()
+                        logger.info(f"Adjusted offset from {current_offset:.2f}s to {new_offset:.2f}s (drift: {drift:.2f}s)")
                         
                         # Recalculate video_start_time when offset changes significantly
                         if video_start_time is not None:
-                            video_start_time = reference_start_time - current_offset
+                            video_start_time = get_global_clock().get_time() - new_offset
                             logger.info(f"Updated video start time: {datetime.fromtimestamp(video_start_time).strftime('%Y-%m-%d %H:%M:%S.%f')}")
                             
-                        # Regenerate WebVTT files with the new offset
-                        await regenerate_all_vtt_files()
+                        # Record the adjusted offset
+                        sync_metrics.record_offset(new_offset, "after_adjustment")
             
         except Exception as e:
             logger.error(f"Error updating latency offset: {e}")
+            sync_metrics.record_error("update_latency_offset_error")
         
         # Sleep before next check
         await asyncio.sleep(OFFSET_ADJUSTMENT_INTERVAL)
@@ -387,28 +289,39 @@ async def regenerate_all_vtt_files():
     Regenerate all WebVTT files from the transcript data.
     This is useful when restarting the service or when the offset has changed significantly.
     """
-    # Clear existing WebVTT files
-    if os.path.exists(f"{WEBVTT_DIR}/ru"):
-        for file_name in os.listdir(f"{WEBVTT_DIR}/ru"):
-            if file_name.endswith(".vtt"):
-                try:
-                    os.remove(f"{WEBVTT_DIR}/ru/{file_name}")
-                except Exception as e:
-                    logger.error(f"Error removing {file_name}: {e}")
+    global vtt_segmenter
     
-    # Get all transcript files
-    transcript_files = []
-    if os.path.exists(TRANSCRIPT_DIR):
-        transcript_files = sorted([
-            f for f in os.listdir(TRANSCRIPT_DIR)
-            if f.startswith("ru_transcript_") and f.endswith(".json")
-        ])
+    start_time = time.time()
     
-    # Process each file
-    for file_name in transcript_files:
-        await process_transcript_file(f"{TRANSCRIPT_DIR}/{file_name}")
-    
-    logger.info(f"Regenerated WebVTT files from {len(transcript_files)} transcript files")
+    try:
+        # Create a new WebVTT segmenter with the current time as reference
+        vtt_segmenter = WebVTTSegmenter(
+            segment_duration=SEGMENT_DURATION,
+            reference_start_time=get_global_clock().get_time()
+        )
+        
+        # Get all transcript files
+        transcript_files = []
+        if os.path.exists(TRANSCRIPT_DIR):
+            transcript_files = sorted([
+                f for f in os.listdir(TRANSCRIPT_DIR)
+                if f.startswith("ru_transcript_") and f.endswith(".json")
+            ])
+        
+        # Process each file
+        processed_count = 0
+        for file_name in transcript_files:
+            if await process_transcript_file(f"{TRANSCRIPT_DIR}/{file_name}"):
+                processed_count += 1
+        
+        # Record performance metrics
+        processing_time = time.time() - start_time
+        sync_metrics.record_processing_time(processing_time, "regenerate_vtt")
+        
+        logger.info(f"Regenerated WebVTT files from {processed_count} transcript files")
+    except Exception as e:
+        logger.error(f"Error regenerating VTT files: {e}")
+        sync_metrics.record_error("regenerate_vtt_error")
 
 async def monitor_transcript_directory():
     """
@@ -442,18 +355,23 @@ async def monitor_transcript_directory():
                         if processed:
                             processed_files[file_name] = mtime
             
+            # Update health metrics
+            sync_metrics.record_health_check("caption_generator", True)
+            
             # Sleep before checking again
             await asyncio.sleep(0.5)
             
         except Exception as e:
             logger.error(f"Error monitoring transcript directory: {e}")
+            sync_metrics.record_health_check("caption_generator", False)
+            sync_metrics.record_error("monitor_transcript_error")
             await asyncio.sleep(5)  # Longer sleep on error
 
 async def main():
     """
     Main entry point for the Caption Generator Service.
     """
-    global reference_start_time
+    global vtt_segmenter
     
     logger.info("Starting Caption Generator Service")
     
@@ -461,9 +379,14 @@ async def main():
     os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
     os.makedirs(f"{WEBVTT_DIR}/ru", exist_ok=True)
     
-    # Load reference clock
-    reference_start_time = load_reference_clock()
-    logger.info(f"Loaded reference start time: {reference_start_time}")
+    # Create a WebVTT segmenter with the current time as reference
+    vtt_segmenter = WebVTTSegmenter(
+        segment_duration=SEGMENT_DURATION,
+        reference_start_time=get_global_clock().get_time()
+    )
+    
+    # Start the metrics manager
+    metrics_manager.start_auto_save()
     
     # Start the offset update task
     offset_task = asyncio.create_task(update_latency_offset())

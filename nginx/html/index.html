@@ -217,7 +217,7 @@
                 // Destroy existing instance if any
                 if (hls) {
                     try {
-                        hls.destroy();
+                    hls.destroy();
                     } catch (e) {
                         logDebug(`Error destroying HLS instance: ${e.message}`);
                     }
@@ -333,13 +333,13 @@
             function initNativePlayer() {
                 if (video.canPlayType('application/vnd.apple.mpegurl')) {
                     logDebug('Using native HLS support (Safari/iOS)');
-                    video.src = MASTER_PLAYLIST_URL;
-                    video.addEventListener('loadedmetadata', function() {
-                        video.play().catch(function(error) {
-                            logDebug(`Autoplay prevented: ${error.message}`);
-                            statusDiv.innerText = 'Click play to start video';
+                        video.src = MASTER_PLAYLIST_URL;
+                        video.addEventListener('loadedmetadata', function() {
+                            video.play().catch(function(error) {
+                                logDebug(`Autoplay prevented: ${error.message}`);
+                                statusDiv.innerText = 'Click play to start video';
+                            });
                         });
-                    });
                     
                     // Log when video starts playing
                     video.addEventListener('playing', function() {
@@ -479,8 +479,8 @@
                             video.textTracks[i].label === 'Russian') {
                             video.textTracks[i].mode = 'showing';
                             logDebug(`Enabled native text track ${i}`);
-                            break;
-                        }
+                        break;
+                    }
                     }
                     return;
                 }

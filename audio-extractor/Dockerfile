@@ -22,9 +22,16 @@ RUN poetry config virtualenvs.create false
 # Install dependencies
 RUN poetry install --no-dev --no-interaction --no-ansi
 
+# Copy shared modules
+COPY shared/ /app/shared/
+
 # Copy application code
 COPY audio-extractor/ /app/
 COPY .env /app/.env
+
+# Install requirements for shared modules
+COPY requirements.txt /app/
+RUN pip install -r requirements.txt
 
 # Set execute permissions
 RUN chmod +x /app/main.py

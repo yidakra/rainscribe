@@ -2,6 +2,8 @@ FROM nginx:1.23-alpine
 
 # Copy NGINX configuration
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
+# Remove default conf to avoid conflicts
+RUN rm -f /etc/nginx/conf.d/default.conf
 
 # Copy HTML files
 COPY nginx/html/ /usr/share/nginx/html/
