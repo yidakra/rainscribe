@@ -1,0 +1,17 @@
+{{- if .Values.sharedVolume.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rainscribe.fullname" . }}-shared-data
+  labels:
+    {{- include "rainscribe.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.sharedVolume.accessModes | nindent 4 }}
+  {{- if .Values.sharedVolume.storageClassName }}
+  storageClassName: {{ .Values.sharedVolume.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.sharedVolume.size }}
+{{- end }} 

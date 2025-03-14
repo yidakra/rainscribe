@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rainscribe.fullname" . }}-audio-extractor
+  labels:
+    {{- include "rainscribe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audio-extractor
+spec:
+  replicas: {{ .Values.audioExtractor.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rainscribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: audio-extractor
+  template:
+    metadata:
+      labels:
+        {{- include "rainscribe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: audio-extractor
+    spec:
+      containers:
+        - name: audio-extractor
+          image: "{{ .Values.audioExtractor.image.repository }}:{{ .Values.audioExtractor.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.audioExtractor.image.pullPolicy }}
+          env:
+            {{- range $key, $value := .Values.global.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.audioExtractor.resources | nindent 12 }}
+          volumeMounts:
+            - name: shared-data
+              mountPath: {{ .Values.global.env.SHARED_VOLUME_PATH }}
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: {{ include "rainscribe.fullname" . }}-shared-data 

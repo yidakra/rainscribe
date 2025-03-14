@@ -1,0 +1,77 @@
+services:
+  volume-init:
+    build:
+      context: .
+      dockerfile: shared-volume-init/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - shared-data:/shared-data
+
+  audio-extractor:
+    build:
+      context: .
+      dockerfile: audio-extractor/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - shared-data:/shared-data
+    depends_on:
+      - volume-init
+    restart: unless-stopped
+
+  transcription-service:
+    build:
+      context: .
+      dockerfile: transcription-service/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - shared-data:/shared-data
+    depends_on:
+      - volume-init
+      - audio-extractor
+    restart: unless-stopped
+
+  caption-generator:
+    build:
+      context: .
+      dockerfile: caption-generator/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - shared-data:/shared-data
+    depends_on:
+      - volume-init
+      - transcription-service
+    restart: unless-stopped
+
+  stream-mirroring:
+    build:
+      context: .
+      dockerfile: stream-mirroring/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - shared-data:/shared-data
+    depends_on:
+      - volume-init
+      - caption-generator
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    ports:
+      - "8080:80"
+    volumes:
+      - shared-data:/shared-data
+    depends_on:
+      - volume-init
+      - stream-mirroring
+    restart: unless-stopped
+
+volumes:
+  shared-data:
+    driver: local 

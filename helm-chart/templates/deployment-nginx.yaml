@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-nginx
+  labels:
+    {{- include "rainscribe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nginx
+spec:
+  replicas: {{ .Values.nginx.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rainscribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nginx
+  template:
+    metadata:
+      labels:
+        {{- include "rainscribe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
+          imagePullPolicy: {{ .Values.nginx.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          volumeMounts:
+            - name: shared-data
+              mountPath: {{ .Values.global.env.SHARED_VOLUME_PATH }}
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-shared-data 

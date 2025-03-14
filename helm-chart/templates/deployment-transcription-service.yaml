@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-transcription-service
+  labels:
+    {{- include "rainscribe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transcription-service
+spec:
+  replicas: {{ .Values.transcriptionService.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rainscribe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: transcription-service
+  template:
+    metadata:
+      labels:
+        {{- include "rainscribe.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: transcription-service
+    spec:
+      containers:
+        - name: transcription-service
+          image: "{{ .Values.transcriptionService.image.repository }}:{{ .Values.transcriptionService.image.tag }}"
+          imagePullPolicy: {{ .Values.transcriptionService.image.pullPolicy }}
+          env:
+            {{- include "rainscribe.env" . | nindent 12 }}
+          volumeMounts:
+            - name: shared-data
+              mountPath: {{ .Values.global.env.SHARED_VOLUME_PATH }}
+          resources:
+            {{- toYaml .Values.transcriptionService.resources | nindent 12 }}
+      volumes:
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-shared-data 

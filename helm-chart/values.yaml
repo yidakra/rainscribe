@@ -1,0 +1,128 @@
+# Default values for rainscribe.
+# This is a YAML-formatted file.
+
+# Global configuration
+global:
+  # Environment variables for all services
+  env:
+    GLADIA_API_KEY: "7d6887be-bcc5-4cac-9d67-6abce0d0e2a6"
+    GLADIA_API_URL: "https://api.gladia.io"
+    HLS_STREAM_URL: "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
+    AUDIO_SAMPLE_RATE: "16000"
+    AUDIO_BIT_DEPTH: "16"
+    AUDIO_CHANNELS: "1"
+    TRANSCRIPTION_LANGUAGE: "ru"
+    TRANSLATION_LANGUAGES: "en,nl"
+    WEBVTT_SEGMENT_DURATION: "10"
+    SHARED_VOLUME_PATH: "/shared-data"
+
+# Shared volume configuration
+sharedVolume:
+  enabled: true
+  storageClassName: "standard"
+  size: "10Gi"
+  accessModes:
+    - ReadWriteMany
+
+# Shared volume initialization job
+volumeInit:
+  image:
+    repository: rainscribe/shared-volume-init
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+# Audio Extractor Service
+audioExtractor:
+  image:
+    repository: rainscribe/audio-extractor
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
+# Transcription & Translation Service
+transcriptionService:
+  image:
+    repository: rainscribe/transcription-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# Caption Generator Service
+captionGenerator:
+  image:
+    repository: rainscribe/caption-generator
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
+# Stream Mirroring Service
+streamMirroring:
+  image:
+    repository: rainscribe/stream-mirroring
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# NGINX Server
+nginx:
+  image:
+    repository: rainscribe/nginx
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    hosts:
+      - host: rainscribe.local
+        paths:
+          - path: /
+            pathType: Prefix
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi 
