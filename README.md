@@ -128,3 +128,22 @@ The system exposes metrics for monitoring:
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Common Issues and Solutions
+
+### Changes not taking effect
+If you make changes to the code and they don't seem to take effect after rebuilding, use the force-update command:
+
+```bash
+make force-update
+```
+
+This will ensure Docker rebuilds all images without cache and properly applies all changes.
+
+For updating a single service without cache, use:
+
+```bash
+make force-update-service SERVICE=service-name
+```
+
+Where `service-name` is one of: audio-extractor, transcription-service, caption-generator, stream-mirroring, or nginx.

@@ -34,9 +34,9 @@ logger = logging.getLogger("reference-clock")
 UPDATE_INTERVAL = int(os.getenv("CLOCK_UPDATE_INTERVAL", "3600"))  # How often to sync with NTP servers (seconds)
 DEFAULT_NTP_SERVERS = [
     "time.google.com",
-    "pool.ntp.org",
-    "time.nist.gov",
-    "time.apple.com",
+    "www.microsoft.com",  # Microsoft's website has reliable Date headers
+    "api.github.com",     # GitHub API has reliable Date headers
+    "www.amazon.com"      # Amazon's website has reliable Date headers
 ]
 MAX_DRIFT = float(os.getenv("CLOCK_MAX_DRIFT", "0.1"))  # Maximum allowed drift in seconds before correction
 CLOCK_STATE_FILE = os.path.expanduser(os.getenv("CLOCK_STATE_FILE", "~/.rainscribe/clock_state.json"))

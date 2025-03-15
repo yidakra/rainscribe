@@ -15,6 +15,7 @@ import asyncio
 import random
 import tempfile
 import shlex
+import glob
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -145,9 +146,10 @@ def build_ffmpeg_command():
         "-f", "hls",
         "-hls_time", str(HLS_SEGMENT_TIME),
         "-hls_list_size", str(HLS_LIST_SIZE + OUTPUT_DELAY_SEGMENTS),  # Increase list size to accommodate delay
-        "-hls_flags", "delete_segments+independent_segments+program_date_time",
+        "-hls_flags", "independent_segments+program_date_time+append_list",  # Append_list allows for continuous streaming
         "-hls_segment_type", "mpegts",
         "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%05d.ts",
+        "-live_start_index", "0",  # Start with the first segment for continuous streaming
         
         # Enable subtitle streams in playlist
         "-hls_subtitle_path", f"{OUTPUT_DIR}/subtitles/",
@@ -201,7 +203,8 @@ async def run_ffmpeg():
                         stdout=f,
                         stderr=subprocess.STDOUT,
                         bufsize=1,
-                        universal_newlines=True
+                        universal_newlines=True,
+                        shell=False  # Ensure it's not run in a shell
                     )
                 
                 # Record start time for metrics
@@ -213,7 +216,11 @@ async def run_ffmpeg():
                 sync_metrics.metrics.add_metric("ffmpeg_restarts", restart_count)
                 sync_metrics.record_health_check("ffmpeg_running", True)
                 
-                logger.info(f"FFmpeg process started (PID: {ffmpeg_process.pid if ffmpeg_process else 'Unknown'})")
+                pid = ffmpeg_process.pid if ffmpeg_process else 'Unknown'
+                logger.info(f"FFmpeg process started (PID: {pid})")
+                # Log more info for debugging
+                if pid != 'Unknown':
+                    logger.info(f"You should be able to see FFmpeg process with: docker exec -it rainscribe-stream-mirroring-1 ps aux | grep ffmpeg")
                 
                 # Wait for process to finish
                 while ffmpeg_process and ffmpeg_process.poll() is None:
@@ -313,26 +320,48 @@ def create_delayed_playlist():
         with open(original_playlist, 'r') as f:
             lines = f.readlines()
         
-        # Parse the playlist to find segment indices
+        # Parse the playlist to find segment indices and media sequence
         segments = []
+        media_sequence = 0
+        target_duration = 10  # Default
+        version = 3  # Default
+        
         for i, line in enumerate(lines):
-            if line.strip().endswith('.ts'):
+            if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+                try:
+                    media_sequence = int(line.split(':', 1)[1].strip())
+                except Exception as e:
+                    logger.warning(f"Error parsing media sequence: {e}")
+            elif line.startswith('#EXT-X-TARGETDURATION:'):
+                try:
+                    target_duration = int(line.split(':', 1)[1].strip())
+                except Exception as e:
+                    logger.warning(f"Error parsing target duration: {e}")
+            elif line.startswith('#EXT-X-VERSION:'):
+                try:
+                    version = int(line.split(':', 1)[1].strip())
+                except Exception as e:
+                    logger.warning(f"Error parsing version: {e}")
+            elif line.strip().endswith('.ts'):
                 segment_name = line.strip()
                 segments.append((i, segment_name))
         
         # If we have enough segments, create a delayed playlist
         if len(segments) > OUTPUT_DELAY_SEGMENTS:
-            # Start with the header lines (up to the first segment)
-            if segments:
-                header_lines = lines[:segments[0][0]]
-            else:
-                header_lines = lines
-                
-            # Collect the delayed segments (skip the most recent ones)
-            delayed_segments = segments[:-OUTPUT_DELAY_SEGMENTS] if OUTPUT_DELAY_SEGMENTS > 0 else segments
+            # Adjust the media sequence for the delay
+            new_media_sequence = max(0, media_sequence - OUTPUT_DELAY_SEGMENTS)
             
-            # Create the new playlist content
-            new_content = ''.join(header_lines)
+            # Start building the new playlist with the header
+            new_content = "#EXTM3U\n"
+            new_content += f"#EXT-X-VERSION:{version}\n"
+            new_content += f"#EXT-X-TARGETDURATION:{target_duration}\n"
+            new_content += f"#EXT-X-MEDIA-SEQUENCE:{new_media_sequence}\n"
+            new_content += "#EXT-X-INDEPENDENT-SEGMENTS\n"
+            
+            # Calculate which segments to include
+            start_idx = max(0, len(segments) - HLS_LIST_SIZE - OUTPUT_DELAY_SEGMENTS)
+            end_idx = max(0, len(segments) - OUTPUT_DELAY_SEGMENTS)
+            delayed_segments = segments[start_idx:end_idx]
             
             # Add the delayed segments and their metadata
             for segment_idx, segment_name in delayed_segments:
@@ -342,33 +371,136 @@ def create_delayed_playlist():
                 if segment_idx > 1 and lines[segment_idx - 2].startswith('#EXT-X-PROGRAM-DATE-TIME'):
                     new_content += lines[segment_idx - 2]
                 new_content += extinf_line
-                new_content += lines[segment_idx]
+                new_content += f"{segment_name}\n"
             
             # Write the delayed playlist
             with open(delayed_playlist, 'w') as f:
                 f.write(new_content)
             
-            logger.info(f"Created delayed playlist at {delayed_playlist} with {len(delayed_segments)} segments, delay of {OUTPUT_DELAY_SECONDS}s")
+            logger.info(f"Created delayed playlist at {delayed_playlist} with {len(delayed_segments)} segments (media sequence {new_media_sequence}), delay of {OUTPUT_DELAY_SECONDS}s")
             
-            # Create symbolic link from default playlist.m3u8 to delayed_playlist.m3u8
-            # This ensures clients using the standard playlist name get the delayed version
-            delayed_playlist_symlink = f"{OUTPUT_DIR}/delayed_symlink.m3u8"
+            # Replace the original playlist with the delayed version
             try:
-                # Create a temporary symlink first
-                if os.path.exists(delayed_playlist_symlink):
-                    os.remove(delayed_playlist_symlink)
-                os.symlink(os.path.basename(delayed_playlist), delayed_playlist_symlink)
-                # Then atomically rename it
-                os.rename(delayed_playlist_symlink, original_playlist)
-                logger.info(f"Updated playlist.m3u8 to point to delayed version")
+                # Write to a temporary file first
+                temp_playlist = f"{original_playlist}.tmp"
+                with open(temp_playlist, 'w') as f:
+                    f.write(new_content)
+                
+                # Then do an atomic replace
+                os.replace(temp_playlist, original_playlist)
+                logger.info(f"Updated playlist.m3u8 with delayed version (media sequence {new_media_sequence})")
             except Exception as e:
-                logger.error(f"Error creating symlink to delayed playlist: {e}")
+                logger.error(f"Error replacing original playlist: {e}")
         else:
             logger.info(f"Not enough segments yet for delayed playlist, need {OUTPUT_DELAY_SEGMENTS}, have {len(segments)}")
             
     except Exception as e:
         logger.error(f"Error creating delayed playlist: {e}")
         sync_metrics.record_error("delayed_playlist_error")
+
+def update_subtitle_symlinks():
+    """Create and update symlinks for subtitle files in the subtitles directory."""
+    try:
+        # Ensure subtitles directory exists
+        subtitles_dir = f"{OUTPUT_DIR}/subtitles"
+        os.makedirs(subtitles_dir, exist_ok=True)
+        
+        # Create symlink for the playlist
+        playlist_src = f"{WEBVTT_DIR}/ru/playlist.m3u8"
+        playlist_dst = f"{subtitles_dir}/playlist.m3u8"
+        
+        if os.path.exists(playlist_src):
+            # Remove existing symlink if it exists
+            if os.path.islink(playlist_dst):
+                os.unlink(playlist_dst)
+            
+            # Create new symlink
+            os.symlink(playlist_src, playlist_dst)
+            logger.debug(f"Created symlink for playlist: {playlist_dst} -> {playlist_src}")
+            
+            # Read the playlist to get the segment numbers directly from it
+            try:
+                with open(playlist_src, 'r') as f:
+                    playlist_content = f.read()
+                    
+                # Extract segment filenames from the playlist
+                import re
+                segment_files_in_playlist = re.findall(r'segment_\d+\.vtt', playlist_content)
+                
+                if segment_files_in_playlist:
+                    logger.info(f"Found {len(segment_files_in_playlist)} segment files in playlist")
+                    
+                    # Create symlinks for each segment file in the playlist
+                    created_count = 0
+                    missing_count = 0
+                    for filename in segment_files_in_playlist:
+                        src_path = f"{WEBVTT_DIR}/ru/{filename}"
+                        dst_path = f"{subtitles_dir}/{filename}"
+                        
+                        # Only create symlink if source file exists
+                        if os.path.isfile(src_path):
+                            # Remove existing symlink if it exists
+                            if os.path.islink(dst_path):
+                                os.unlink(dst_path)
+                            
+                            # Create new symlink
+                            os.symlink(src_path, dst_path)
+                            created_count += 1
+                        else:
+                            logger.warning(f"Source file not found: {src_path}")
+                            missing_count += 1
+                    
+                    logger.info(f"Created {created_count} symlinks from playlist, {missing_count} source files missing")
+            except Exception as e:
+                logger.error(f"Error processing playlist: {e}")
+                # If there's an error with the playlist, fall back to directory scan
+                logger.info("Falling back to directory scan")
+        else:
+            logger.warning(f"Playlist file not found: {playlist_src}")
+        
+        # As a fallback, also check the directory for any segment files
+        segment_pattern = f"{WEBVTT_DIR}/ru/segment_*.vtt"
+        segment_files = [f for f in glob.glob(segment_pattern) if os.path.isfile(f)]
+        
+        # Create symlinks for each segment file
+        fallback_count = 0
+        for src_path in segment_files:
+            filename = os.path.basename(src_path)
+            dst_path = f"{subtitles_dir}/{filename}"
+            
+            # Remove existing symlink if it exists
+            if os.path.islink(dst_path):
+                os.unlink(dst_path)
+            
+            # Create new symlink
+            os.symlink(src_path, dst_path)
+            fallback_count += 1
+        
+        if fallback_count > 0:
+            logger.info(f"Created {fallback_count} additional symlinks from directory scan")
+        
+        # Check for recently modified files to debug issues
+        try:
+            newest_files = sorted(
+                [(f, os.path.getmtime(f)) for f in glob.glob(f"{WEBVTT_DIR}/ru/segment_*.vtt") if os.path.isfile(f)],
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]  # Get 5 newest files
+            
+            if newest_files:
+                logger.info("Most recent VTT files:")
+                for file_path, mtime in newest_files:
+                    logger.info(f"  {file_path} - {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                logger.warning("No VTT files found in source directory!")
+        except Exception as e:
+            logger.error(f"Error checking most recent files: {e}")
+        
+        total_symlinks = len([f for f in os.listdir(subtitles_dir) if f.startswith("segment_") and f.endswith(".vtt")])
+        logger.info(f"Updated subtitle symlinks: {total_symlinks} files")
+    except Exception as e:
+        logger.error(f"Error updating subtitle symlinks: {e}")
+        sync_metrics.record_error("subtitle_symlinks_error")
 
 async def monitor_health():
     """Periodically check the health of the FFmpeg process and update metrics."""
@@ -404,6 +536,9 @@ async def monitor_health():
             # Also update the delayed playlist
             create_delayed_playlist()
             
+            # Update subtitle symlinks
+            update_subtitle_symlinks()
+            
         except Exception as e:
             logger.error(f"Error in health check: {e}")
             sync_metrics.record_error("health_check_error")
@@ -417,18 +552,40 @@ async def monitor_health():
 async def run_async_tasks():
     """Run all async tasks."""
     try:
-        # Create tasks
+        # Start FFmpeg in a separate task
         ffmpeg_task = asyncio.create_task(run_ffmpeg())
+        
+        # Start health check in a separate task
         health_task = asyncio.create_task(monitor_health())
         
+        # Start delayed playlist task
+        delayed_playlist_task = asyncio.create_task(delayed_playlist_loop())
+        
         # Wait for tasks to complete
-        await asyncio.gather(ffmpeg_task, health_task)
+        await asyncio.gather(ffmpeg_task, health_task, delayed_playlist_task)
     except asyncio.CancelledError:
         logger.info("Tasks cancelled")
     except Exception as e:
         logger.error(f"Error in async tasks: {e}")
     finally:
         stop_ffmpeg()
+
+async def delayed_playlist_loop():
+    """Run the delayed playlist creation in a loop."""
+    while running:
+        try:
+            # Create the delayed playlist
+            create_delayed_playlist()
+            logger.info("Delayed playlist check completed")
+        except Exception as e:
+            logger.error(f"Error in delayed playlist loop: {e}")
+            sync_metrics.record_error("delayed_playlist_loop_error")
+        
+        # Wait 10 seconds before checking again
+        for _ in range(10):
+            if not running:
+                break
+            await asyncio.sleep(1)
 
 def main():
     """Main entry point."""

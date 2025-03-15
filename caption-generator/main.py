@@ -11,6 +11,8 @@ import sys
 import json
 import time
 import asyncio
+import tempfile
+import shutil
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from typing import Dict, List, Optional, Any
@@ -366,6 +368,36 @@ async def monitor_transcript_directory():
             sync_metrics.record_health_check("caption_generator", False)
             sync_metrics.record_error("monitor_transcript_error")
             await asyncio.sleep(5)  # Longer sleep on error
+
+def write_vtt_file(output_path, vtt_content):
+    """Write a WebVTT file to disk, ensuring it's properly saved."""
+    try:
+        # Create a temporary file in the same directory
+        dir_path = os.path.dirname(output_path)
+        os.makedirs(dir_path, exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_path) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(vtt_content)
+        
+        # Rename the temporary file to the target name (atomic operation)
+        shutil.move(temp_path, output_path)
+        
+        # Verify the file exists and has content
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            if file_size > 0:
+                logger.debug(f"Successfully wrote VTT file: {output_path} ({file_size} bytes)")
+                return True
+            else:
+                logger.error(f"VTT file has zero size: {output_path}")
+                return False
+        else:
+            logger.error(f"Failed to create VTT file: {output_path}")
+            return False
+    except Exception as e:
+        logger.error(f"Error writing VTT file {output_path}: {e}")
+        return False
 
 async def main():
     """

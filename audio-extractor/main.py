@@ -32,7 +32,7 @@ load_dotenv()
 
 # Configuration from environment variables with defaults
 HLS_STREAM_URL = os.getenv("HLS_STREAM_URL")
-AUDIO_OUTPUT_MODE = os.getenv("AUDIO_OUTPUT_MODE", "pipe")  # "pipe" or "chunks"
+AUDIO_OUTPUT_MODE = os.getenv("AUDIO_OUTPUT_MODE", "chunks")  # "pipe" or "chunks"
 SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 BIT_DEPTH = int(os.getenv("AUDIO_BIT_DEPTH", "16"))
 CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
@@ -89,12 +89,12 @@ def stop_ffmpeg():
             ffmpeg_process = None
             sync_metrics.record_health_check("ffmpeg_running", False)
 
-async def build_ffmpeg_command(mode="pipe"):
+async def build_ffmpeg_command(mode="chunks"):
     """
-    Build the FFmpeg command based on the output mode.
+    Build the FFmpeg command for audio extraction.
     
     Args:
-        mode: The output mode ("pipe" or "chunks")
+        mode: The output mode, either "pipe" or "chunks"
         
     Returns:
         list: The FFmpeg command as a list of arguments
@@ -122,21 +122,17 @@ async def build_ffmpeg_command(mode="pipe"):
         "-bufsize", str(BUFFER_SIZE),
     ])
     
-    # Output configuration based on mode
-    if mode == "pipe":
-        # Output to named pipe
-        cmd.extend(["-f", "wav", AUDIO_PIPE_PATH])
-    elif mode == "chunks":
-        # Output as audio chunks
-        timestamp = int(time.time())
-        chunk_pattern = f"{AUDIO_CHUNKS_DIR}/audio_%d_{timestamp}.wav"
-        cmd.extend([
-            "-f", "segment",
-            "-segment_time", str(AUDIO_CHUNK_DURATION),
-            "-segment_format", "wav",
-            "-reset_timestamps", "1",
-            chunk_pattern
-        ])
+    # Always use chunks mode
+    # Output as audio chunks
+    timestamp = int(time.time())
+    chunk_pattern = f"{AUDIO_CHUNKS_DIR}/audio_%d_{timestamp}.wav"
+    cmd.extend([
+        "-f", "segment",
+        "-segment_time", str(AUDIO_CHUNK_DURATION),
+        "-segment_format", "wav",
+        "-reset_timestamps", "1",
+        chunk_pattern
+    ])
     
     logger.info(f"FFmpeg command: {' '.join(cmd)}")
     return cmd
@@ -174,7 +170,7 @@ async def extract_audio():
     while running and retries < MAX_RETRIES:
         try:
             # Build FFmpeg command
-            ffmpeg_cmd = await build_ffmpeg_command(AUDIO_OUTPUT_MODE)
+            ffmpeg_cmd = await build_ffmpeg_command("chunks")  # Force chunks mode
             
             # Create temporary log file for FFmpeg output
             with tempfile.NamedTemporaryFile(mode='w+', prefix='ffmpeg_', suffix='.log', delete=False) as log_file:
@@ -289,9 +285,6 @@ async def main():
         return
     
     try:
-        # Start metrics server
-        metrics_manager.start_server()
-        
         # Start tasks
         extraction_task = asyncio.create_task(extract_audio())
         health_task = asyncio.create_task(health_check())

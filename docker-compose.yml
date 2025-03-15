@@ -15,6 +15,8 @@ services:
     env_file:
       - .env
     environment:
+      # Audio configuration
+      - AUDIO_OUTPUT_MODE=chunks
       # Clock configuration
       - CLOCK_UPDATE_INTERVAL=1800
       - CLOCK_MAX_DRIFT=0.1
@@ -105,6 +107,7 @@ services:
       - INPUT_URL=${HLS_STREAM_URL}
     volumes:
       - shared-data:/shared-data
+      - ./scripts:/app/scripts
     depends_on:
       - volume-init
       - caption-generator
