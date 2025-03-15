@@ -1,4 +1,4 @@
-.PHONY: build up down logs clean install deploy update update-audio-extractor update-transcription update-caption update-stream-mirroring update-nginx restart-service force-update force-build
+.PHONY: build up down logs clean install deploy update update-audio-extractor update-transcription update-caption update-stream-mirroring update-nginx restart-service force-update force-build force-update-service logs-service follow-logs-service clean-webvtt
 
 # Docker Compose commands
 build:
@@ -19,6 +19,11 @@ logs:
 
 clean:
 	docker compose down -v
+
+# Clean WebVTT files from shared volume
+clean-webvtt:
+	docker exec -it rainscribe-nginx-1 sh -c "rm -f /shared-data/webvtt/ru/segment_*.vtt && echo 'Removed old WebVTT segments'" || echo "Failed to remove WebVTT files"
+	docker exec -it rainscribe-nginx-1 sh -c "rm -f /shared-data/hls/subtitles/segment_*.vtt && echo 'Removed subtitle symlinks'" || echo "Failed to remove subtitle symlinks"
 
 # Service update commands
 update: down build up
@@ -70,6 +75,25 @@ restart-service:
 	docker compose rm -f $(SERVICE)
 	docker compose up -d $(SERVICE)
 	@echo "Service $(SERVICE) restarted successfully"
+	@echo "To view logs, run: make logs-service SERVICE=$(SERVICE)"
+	@echo "To follow logs continuously, run: make follow-logs-service SERVICE=$(SERVICE)"
+
+# New target to view logs for a specific service
+logs-service:
+	@if [ -z "$(SERVICE)" ]; then \
+		echo "Error: SERVICE not specified"; \
+		echo "Usage: make logs-service SERVICE=service-name"; \
+		exit 1; \
+	fi
+	docker compose logs $(SERVICE)
+
+# Target to follow logs for a specific service
+follow-logs-service:
+	@if [ -z "$(SERVICE)" ]; then \
+		echo "Error: SERVICE not specified"; \
+		echo "Usage: make follow-logs-service SERVICE=service-name"; \
+		exit 1; \
+	fi
 	docker compose logs -f $(SERVICE)
 
 # Kubernetes/Helm commands
@@ -109,6 +133,7 @@ help:
 	@echo "  down                 - Stop all services"
 	@echo "  logs                 - View logs from all services"
 	@echo "  clean                - Stop all services and remove volumes"
+	@echo "  clean-webvtt         - Remove old WebVTT subtitle files"
 	@echo "  update               - Full rebuild and restart of all services"
 	@echo "  force-update         - Full rebuild with no cache and restart of all services"
 	@echo "  update-audio-extractor - Rebuild and restart just the audio-extractor"
@@ -118,6 +143,8 @@ help:
 	@echo "  update-nginx         - Rebuild and restart just the nginx service"
 	@echo "  force-update-service - Force rebuild a service with no cache (usage: make force-update-service SERVICE=name)"
 	@echo "  restart-service      - Restart a specific service (usage: make restart-service SERVICE=name)"
+	@echo "  logs-service         - View logs for a specific service (usage: make logs-service SERVICE=name)"
+	@echo "  follow-logs-service  - Follow logs for a specific service (usage: make follow-logs-service SERVICE=name)"
 	@echo "  install-deps         - Install Poetry dependencies"
 	@echo "  build-images         - Build Docker images for Kubernetes"
 	@echo "  push-images          - Push Docker images to a registry"

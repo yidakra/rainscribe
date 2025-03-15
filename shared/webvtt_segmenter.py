@@ -24,11 +24,8 @@ except ImportError:
     get_global_clock = None
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("webvtt-segmenter")
+logger = logging.getLogger('webvtt-segmenter')
+logger.setLevel(logging.DEBUG)
 
 # Constants from environment variables with defaults
 DEFAULT_SEGMENT_DURATION = float(os.getenv("WEBVTT_SEGMENT_DURATION", "10.0"))  # Default segment duration in seconds
@@ -74,10 +71,13 @@ class WebVTTCue:
         start_with_offset = max(0, self.start_time + offset)
         end_with_offset = max(start_with_offset + 0.1, self.end_time + offset)
         
+        # Ensure the text is stripped of any extra whitespace
+        clean_text = self.text.strip()
+        
         return (
             f"{self.cue_id}\n"
             f"{format_timestamp(start_with_offset)} --> {format_timestamp(end_with_offset)}\n"
-            f"{self.text}\n\n"
+            f"{clean_text}\n\n"
         )
     
     def overlaps(self, start_time: float, end_time: float) -> bool:
@@ -91,7 +91,10 @@ class WebVTTCue:
         Returns:
             bool: True if the cue overlaps with the range
         """
-        return (self.start_time < end_time) and (self.end_time > start_time)
+        overlaps = (self.start_time < end_time) and (self.end_time > start_time)
+        # Print all cue timestamps for debugging
+        logger.debug(f"Checking cue {self.cue_id} [{self.start_time:.3f} - {self.end_time:.3f}] against segment [{start_time:.3f} - {end_time:.3f}], overlaps: {overlaps}")
+        return overlaps
     
     def clip_to_range(self, start_time: float, end_time: float) -> Optional['WebVTTCue']:
         """
@@ -199,25 +202,63 @@ class WebVTTSegmenter:
     
     def get_segment_cues(self, segment_index: int) -> List[WebVTTCue]:
         """
-        Get all cues that should appear in the given segment.
+        Get all cues that overlap with the specified segment.
         
         Args:
-            segment_index: The segment index (0-based)
+            segment_index: The index of the segment.
             
         Returns:
-            List[WebVTTCue]: List of cues for the segment
+            A list of WebVTTCue objects that overlap with the segment.
         """
-        segment_start = self.get_segment_start_time(segment_index)
-        segment_end = segment_start + self.segment_duration
+        segment_start_time = self.get_segment_start_time(segment_index)
+        segment_end_time = segment_start_time + self.segment_duration
         
-        # Include overlap for smoother transitions
-        if segment_index > 0:
-            segment_start -= self.segment_overlap
+        # Log the absolute time range for debugging
+        logger.debug(f"Segment {segment_index}: absolute time range [{segment_start_time:.3f} - {segment_end_time:.3f}]")
         
-        return [
-            cue for cue in self.cues 
-            if cue.overlaps(segment_start, segment_end)
-        ]
+        # Calculate relative time range (seconds from start of video)
+        # If reference_start_time is set, use it as the base
+        if self.reference_start_time is not None:
+            # For regenerate_all_vtt_files, we're using current time as reference_start_time
+            # But cues have timestamps relative to video start (0, 1, 2, etc.)
+            # So we need to use segment_index to calculate relative time
+            relative_start = segment_index * self.segment_duration
+            relative_end = (segment_index + 1) * self.segment_duration
+            
+            # Add overlap to ensure we catch cues at segment boundaries
+            relative_start = max(0, relative_start - self.segment_overlap)
+            relative_end = relative_end + self.segment_overlap
+        else:
+            # If no reference time, assume segments start at 0
+            relative_start = segment_index * self.segment_duration
+            relative_end = (segment_index + 1) * self.segment_duration
+        
+        logger.debug(f"Segment {segment_index}: relative time range [{relative_start:.3f} - {relative_end:.3f}]")
+        
+        # Check if we need to adjust the relative time range to match transcript timestamps
+        # This is needed when transcript timestamps are much larger than segment indices
+        # (e.g., transcript timestamps are 100-1000+ seconds but segments are 0-10)
+        if self.cues and len(self.cues) > 0:
+            # Check if there's a significant mismatch between cue timestamps and segment times
+            avg_cue_start = sum(cue.start_time for cue in self.cues[:min(10, len(self.cues))]) / min(10, len(self.cues))
+            if avg_cue_start > relative_end * 10:  # If average cue start time is much larger than segment end time
+                logger.info(f"Detected timestamp mismatch: avg cue start {avg_cue_start:.3f} vs segment end {relative_end:.3f}")
+                # Find the minimum cue start time to use as a base offset
+                min_cue_start = min(cue.start_time for cue in self.cues)
+                # Adjust the relative time range to match the cue timestamps
+                adjusted_start = min_cue_start + relative_start
+                adjusted_end = min_cue_start + relative_end
+                logger.debug(f"Adjusted segment {segment_index} time range: [{adjusted_start:.3f} - {adjusted_end:.3f}]")
+                relative_start = adjusted_start
+                relative_end = adjusted_end
+        
+        matching_cues = []
+        for cue in self.cues:
+            if cue.overlaps(relative_start, relative_end):
+                matching_cues.append(cue)
+        
+        logger.info(f"Segment {segment_index}: time range [{relative_start:.3f} - {relative_end:.3f}], found {len(matching_cues)} matching cues out of {len(self.cues)} total cues")
+        return matching_cues
     
     def get_segment_content(self, segment_index: int, offset: float = 0.0) -> str:
         """
@@ -248,28 +289,32 @@ class WebVTTSegmenter:
         
         # X-TIMESTAMP-MAP for HLS compatibility
         if self.sync_with_hls:
-            # Add timestamp map to align with HLS segments
-            mpegts_time = (segment_start) * 90000  # Convert to MPEG-TS timebase
-            content += f"X-TIMESTAMP-MAP=MPEGTS:{int(mpegts_time)},LOCAL:00:00:00.000\n\n"
+            # Add HLS timestamp mapping if enabled
+            # See: https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/HTTP_Live_Streaming_Metadata_Spec/7_WebVTT/7_WebVTT.html
+            mpegts_value = int(((segment_start * 90000) + 0x100000000) % 0x200000000)
+            local_time = format_timestamp(0)  # Local time is always 00:00:00.000
+            content += f"X-TIMESTAMP-MAP=MPEGTS:{mpegts_value},LOCAL:{local_time}\n\n"
         
-        # Add cues, but ensure timestamps are relative to segment start
+        # Add cues, adjusting timestamps appropriately
         for i, cue in enumerate(segment_cues):
-            # Clip cue to segment if needed
-            clipped_cue = cue
             if self.sync_with_hls:
-                # For true HLS alignment, we need to make timestamps relative
-                # to the segment start time
-                cue_relative_start = cue.start_time - segment_start
-                cue_relative_end = cue.end_time - segment_start
-                # Create a new cue with relative timestamps
-                clipped_cue = WebVTTCue(
+                # For HLS alignment, we should calculate the relative timestamp
+                # but we MUST preserve the original non-zero timestamps to ensure
+                # cues appear at the correct time relative to each other
+                relative_start = cue.start_time
+                relative_end = cue.end_time
+                
+                # Create a new cue with the adjusted timestamps
+                adjusted_cue = WebVTTCue(
                     cue.cue_id,
-                    cue_relative_start,
-                    cue_relative_end,
+                    relative_start,
+                    relative_end,
                     cue.text
                 )
-            
-            content += clipped_cue.to_vtt(offset)
+                content += adjusted_cue.to_vtt(offset)
+            else:
+                # No HLS sync, use cues as is
+                content += cue.to_vtt(offset)
         
         return content
     
@@ -290,8 +335,17 @@ class WebVTTSegmenter:
         """
         content = self.get_segment_content(segment_index, offset)
         
-        # Format filename
-        filename = filename_template.format(index=segment_index)
+        # Format filename - handle both Python-style and C-style format strings
+        if '{index}' in filename_template:
+            # Python-style format string
+            filename = filename_template.format(index=segment_index)
+        elif '%' in filename_template:
+            # C-style format string
+            filename = filename_template % segment_index
+        else:
+            # Fallback - just append the index
+            filename = f"{filename_template}_{segment_index}"
+            
         output_path = os.path.join(output_dir, filename)
         
         # Ensure output directory exists
@@ -302,6 +356,9 @@ class WebVTTSegmenter:
             with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=output_dir) as temp_file:
                 temp_file.write(content)
                 temp_path = temp_file.name
+                
+            # Set permissions on the temp file to ensure it's readable
+            os.chmod(temp_path, 0o644)
                 
             # Rename to target (atomic operation)
             os.replace(temp_path, output_path)

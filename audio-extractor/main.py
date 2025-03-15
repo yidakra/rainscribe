@@ -122,17 +122,24 @@ async def build_ffmpeg_command(mode="chunks"):
         "-bufsize", str(BUFFER_SIZE),
     ])
     
-    # Always use chunks mode
-    # Output as audio chunks
-    timestamp = int(time.time())
-    chunk_pattern = f"{AUDIO_CHUNKS_DIR}/audio_%d_{timestamp}.wav"
-    cmd.extend([
-        "-f", "segment",
-        "-segment_time", str(AUDIO_CHUNK_DURATION),
-        "-segment_format", "wav",
-        "-reset_timestamps", "1",
-        chunk_pattern
-    ])
+    # Use the requested mode
+    if mode == "pipe" or AUDIO_OUTPUT_MODE == "pipe":
+        # Output to named pipe
+        cmd.extend([
+            "-f", "wav",
+            AUDIO_PIPE_PATH
+        ])
+    else:
+        # Output as audio chunks
+        timestamp = int(time.time())
+        chunk_pattern = f"{AUDIO_CHUNKS_DIR}/audio_%d_{timestamp}.wav"
+        cmd.extend([
+            "-f", "segment",
+            "-segment_time", str(AUDIO_CHUNK_DURATION),
+            "-segment_format", "wav",
+            "-reset_timestamps", "1",
+            chunk_pattern
+        ])
     
     logger.info(f"FFmpeg command: {' '.join(cmd)}")
     return cmd
@@ -170,7 +177,7 @@ async def extract_audio():
     while running and retries < MAX_RETRIES:
         try:
             # Build FFmpeg command
-            ffmpeg_cmd = await build_ffmpeg_command("chunks")  # Force chunks mode
+            ffmpeg_cmd = await build_ffmpeg_command(AUDIO_OUTPUT_MODE)
             
             # Create temporary log file for FFmpeg output
             with tempfile.NamedTemporaryFile(mode='w+', prefix='ffmpeg_', suffix='.log', delete=False) as log_file:

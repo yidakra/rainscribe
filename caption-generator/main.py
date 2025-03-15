@@ -158,6 +158,7 @@ async def process_transcript_file(file_path: str):
             text=text
         )
         vtt_segmenter.add_cue(cue)
+        logger.info(f"Added cue: '{text[:30]}...' - Total cues in segmenter: {len(vtt_segmenter.cues)}")
         
         # Store this cue in our recent cues list
         cue_data = {
@@ -316,6 +317,14 @@ async def regenerate_all_vtt_files():
             if await process_transcript_file(f"{TRANSCRIPT_DIR}/{file_name}"):
                 processed_count += 1
         
+        # Debug: Print the timestamps of the first 5 cues
+        if vtt_segmenter.cues:
+            logger.debug(f"First 5 cues timestamps after processing all transcripts:")
+            for i, cue in enumerate(vtt_segmenter.cues[:5]):
+                logger.debug(f"Cue {i}: start_time={cue.start_time:.3f}, end_time={cue.end_time:.3f}, text='{cue.text[:30]}...'")
+        else:
+            logger.debug("No cues in the segmenter after processing all transcripts")
+        
         # Record performance metrics
         processing_time = time.time() - start_time
         sync_metrics.record_processing_time(processing_time, "regenerate_vtt")
@@ -379,6 +388,9 @@ def write_vtt_file(output_path, vtt_content):
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=dir_path) as temp_file:
             temp_path = temp_file.name
             temp_file.write(vtt_content)
+        
+        # Set permissions to ensure file is readable by nginx
+        os.chmod(temp_path, 0o644)
         
         # Rename the temporary file to the target name (atomic operation)
         shutil.move(temp_path, output_path)

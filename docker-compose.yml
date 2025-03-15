@@ -16,7 +16,7 @@ services:
       - .env
     environment:
       # Audio configuration
-      - AUDIO_OUTPUT_MODE=chunks
+      - AUDIO_OUTPUT_MODE=pipe
       # Clock configuration
       - CLOCK_UPDATE_INTERVAL=1800
       - CLOCK_MAX_DRIFT=0.1
