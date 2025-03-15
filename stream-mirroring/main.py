@@ -45,6 +45,10 @@ USE_COPYTS = os.getenv("FFMPEG_COPYTS", "1") == "1"
 START_AT_ZERO = os.getenv("FFMPEG_START_AT_ZERO", "1") == "1"
 FFMPEG_EXTRA_OPTIONS = os.getenv("FFMPEG_EXTRA_OPTIONS", "")
 USE_PROGRAM_DATE_TIME = os.getenv("FFMPEG_USE_PROGRAM_DATE_TIME", "1") == "1"
+# New configuration for output delay
+OUTPUT_DELAY_SECONDS = int(os.getenv("VIDEO_OUTPUT_DELAY_SECONDS", "30"))
+# Calculate how many segments this represents
+OUTPUT_DELAY_SEGMENTS = max(1, OUTPUT_DELAY_SECONDS // HLS_SEGMENT_TIME)
 
 # Get metrics manager
 metrics_manager = get_metrics_manager()
@@ -140,7 +144,7 @@ def build_ffmpeg_command():
         # Output HLS settings
         "-f", "hls",
         "-hls_time", str(HLS_SEGMENT_TIME),
-        "-hls_list_size", str(HLS_LIST_SIZE),
+        "-hls_list_size", str(HLS_LIST_SIZE + OUTPUT_DELAY_SEGMENTS),  # Increase list size to accommodate delay
         "-hls_flags", "delete_segments+independent_segments+program_date_time",
         "-hls_segment_type", "mpegts",
         "-hls_segment_filename", f"{OUTPUT_DIR}/segment_%05d.ts",
@@ -279,17 +283,92 @@ def create_master_playlist():
         content += "playlist.m3u8\n"
         
         # Add subtitle tracks if they exist
-        if os.path.exists(f"{WEBVTT_DIR}/playlist.m3u8"):
-            content += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Subtitles\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"ru\",URI=\"../webvtt/playlist.m3u8\"\n"
+        if os.path.exists(f"{WEBVTT_DIR}/ru/playlist.m3u8"):
+            # Use the subtitles directory which has symlinks to the actual subtitle files
+            content += "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Subtitles\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"ru\",URI=\"subtitles/playlist.m3u8\"\n"
         
         # Write to the file
         with open(master_path, 'w') as f:
             f.write(content)
         
         logger.info(f"Created master playlist at {master_path}")
+        
+        # Create or update a delayed playlist
+        create_delayed_playlist()
     except Exception as e:
         logger.error(f"Error creating master playlist: {e}")
         sync_metrics.record_error("master_playlist_error")
+
+def create_delayed_playlist():
+    """Create a delayed playlist that references older segments to allow time for captions to be generated."""
+    try:
+        original_playlist = f"{OUTPUT_DIR}/playlist.m3u8"
+        delayed_playlist = f"{OUTPUT_DIR}/delayed_playlist.m3u8"
+        
+        # Check if the original playlist exists
+        if not os.path.exists(original_playlist):
+            logger.warning(f"Original playlist {original_playlist} does not exist yet, skipping delayed playlist creation")
+            return
+        
+        with open(original_playlist, 'r') as f:
+            lines = f.readlines()
+        
+        # Parse the playlist to find segment indices
+        segments = []
+        for i, line in enumerate(lines):
+            if line.strip().endswith('.ts'):
+                segment_name = line.strip()
+                segments.append((i, segment_name))
+        
+        # If we have enough segments, create a delayed playlist
+        if len(segments) > OUTPUT_DELAY_SEGMENTS:
+            # Start with the header lines (up to the first segment)
+            if segments:
+                header_lines = lines[:segments[0][0]]
+            else:
+                header_lines = lines
+                
+            # Collect the delayed segments (skip the most recent ones)
+            delayed_segments = segments[:-OUTPUT_DELAY_SEGMENTS] if OUTPUT_DELAY_SEGMENTS > 0 else segments
+            
+            # Create the new playlist content
+            new_content = ''.join(header_lines)
+            
+            # Add the delayed segments and their metadata
+            for segment_idx, segment_name in delayed_segments:
+                # Add the EXTINF line before the segment
+                extinf_line = lines[segment_idx - 1]
+                # If there's a program date time, include that too
+                if segment_idx > 1 and lines[segment_idx - 2].startswith('#EXT-X-PROGRAM-DATE-TIME'):
+                    new_content += lines[segment_idx - 2]
+                new_content += extinf_line
+                new_content += lines[segment_idx]
+            
+            # Write the delayed playlist
+            with open(delayed_playlist, 'w') as f:
+                f.write(new_content)
+            
+            logger.info(f"Created delayed playlist at {delayed_playlist} with {len(delayed_segments)} segments, delay of {OUTPUT_DELAY_SECONDS}s")
+            
+            # Create symbolic link from default playlist.m3u8 to delayed_playlist.m3u8
+            # This ensures clients using the standard playlist name get the delayed version
+            delayed_playlist_symlink = f"{OUTPUT_DIR}/delayed_symlink.m3u8"
+            try:
+                # Create a temporary symlink first
+                if os.path.exists(delayed_playlist_symlink):
+                    os.remove(delayed_playlist_symlink)
+                os.symlink(os.path.basename(delayed_playlist), delayed_playlist_symlink)
+                # Then atomically rename it
+                os.rename(delayed_playlist_symlink, original_playlist)
+                logger.info(f"Updated playlist.m3u8 to point to delayed version")
+            except Exception as e:
+                logger.error(f"Error creating symlink to delayed playlist: {e}")
+        else:
+            logger.info(f"Not enough segments yet for delayed playlist, need {OUTPUT_DELAY_SEGMENTS}, have {len(segments)}")
+            
+    except Exception as e:
+        logger.error(f"Error creating delayed playlist: {e}")
+        sync_metrics.record_error("delayed_playlist_error")
 
 async def monitor_health():
     """Periodically check the health of the FFmpeg process and update metrics."""
@@ -321,6 +400,9 @@ async def monitor_health():
             # Check and update the master playlist periodically
             if (not ffmpeg_process or ffmpeg_process.poll() is not None) and running:
                 create_master_playlist()
+            
+            # Also update the delayed playlist
+            create_delayed_playlist()
             
         except Exception as e:
             logger.error(f"Error in health check: {e}")
@@ -360,6 +442,7 @@ def main():
     logger.info(f"Starting Stream Mirroring Service")
     logger.info(f"Input: {INPUT_URL}")
     logger.info(f"Output directory: {OUTPUT_DIR}")
+    logger.info(f"Output delay: {OUTPUT_DELAY_SECONDS}s ({OUTPUT_DELAY_SEGMENTS} segments)")
     
     try:
         # Get reference clock

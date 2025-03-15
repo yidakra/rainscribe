@@ -39,6 +39,7 @@ The system can be configured through environment variables. See the `.env` file 
 - `WEBVTT_SEGMENT_DURATION`: Duration of each WebVTT segment in seconds (default: 10)
 - `TRANSCRIPTION_LANGUAGE`: Language code for transcription (default: "ru")
 - `GLADIA_API_KEY`: API key for Gladia transcription service (required)
+- `VIDEO_OUTPUT_DELAY_SECONDS`: Delay for the output stream in seconds to ensure captions are ready (default: 30)
 
 ### Clock and Synchronization Variables
 
@@ -114,6 +115,7 @@ If subtitles are not appearing or are appearing incorrectly:
 2. Check that the master playlist references the subtitle tracks correctly
 3. Adjust `SUBTITLE_DISPLAY_WINDOW` if subtitles are disappearing too quickly
 4. Use a player that supports HLS with WebVTT subtitles (like VLC or hls.js-based players)
+5. Try increasing the `VIDEO_OUTPUT_DELAY_SECONDS` value to give more time for subtitle generation
 
 ## Monitoring
 

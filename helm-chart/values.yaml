@@ -15,6 +15,7 @@ global:
     TRANSLATION_LANGUAGES: "en,nl"
     WEBVTT_SEGMENT_DURATION: "10"
     SHARED_VOLUME_PATH: "/shared-data"
+    VIDEO_OUTPUT_DELAY_SECONDS: "30"
 
 # Shared volume configuration
 sharedVolume:

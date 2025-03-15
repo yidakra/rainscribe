@@ -35,7 +35,7 @@ UPDATE_INTERVAL = int(os.getenv("CLOCK_UPDATE_INTERVAL", "3600"))  # How often t
 DEFAULT_NTP_SERVERS = [
     "time.google.com",
     "pool.ntp.org",
-    "time.cloudflare.com",
+    "time.nist.gov",
     "time.apple.com",
 ]
 MAX_DRIFT = float(os.getenv("CLOCK_MAX_DRIFT", "0.1"))  # Maximum allowed drift in seconds before correction

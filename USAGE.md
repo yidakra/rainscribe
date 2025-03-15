@@ -36,6 +36,9 @@ WEBVTT_SEGMENT_OVERLAP=1.0
 WEBVTT_TIME_SOURCE=reference_clock
 HLS_CLOCK_SYNC=true
 
+# Output Delay
+VIDEO_OUTPUT_DELAY_SECONDS=30
+
 # FFmpeg Configuration
 FFMPEG_COPYTS=1
 FFMPEG_START_AT_ZERO=1
@@ -95,6 +98,18 @@ The WebVTT segmenter and FFmpeg must use consistent segment durations:
 
 3. **HLS Sync:** Setting `HLS_CLOCK_SYNC=true` makes WebVTT segments align precisely with HLS segments using program date time values.
 
+### Output Delay
+
+The system can intentionally delay the output stream to ensure captions have enough time to be generated:
+
+1. **Delay Configuration:** Set `VIDEO_OUTPUT_DELAY_SECONDS` to specify how many seconds the output stream should be delayed (default is 30 seconds).
+
+2. **How It Works:** The Stream Mirroring service creates a delayed playlist that references older segments, giving the caption generation pipeline enough time to process and create subtitles for those segments.
+
+3. **Trade-offs:** Increasing the delay improves caption reliability but increases the overall latency for viewers. In most cases, 20-30 seconds provides a good balance.
+
+4. **Dynamic Adjustment:** You can modify this value based on your specific requirements. For slower transcription services or more complex audio, you might need to increase the delay.
+
 ## Troubleshooting
 
 ### Subtitle Delay
@@ -105,6 +120,7 @@ If subtitles appear consistently too early or too late:
 2. Look for patterns in the `current_offset` value - it should stabilize after a few minutes
 3. Adjust the `BUFFER_DURATION` if needed - this adds extra delay to account for processing time
 4. Restart the system with a different initial offset value if necessary
+5. Consider increasing the `VIDEO_OUTPUT_DELAY_SECONDS` value if subtitles are consistently missing or appearing too late
 
 ### Subtitle Drift
 
