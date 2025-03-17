@@ -13,12 +13,20 @@ Rainscribe is a live transcription and translation tool that creates embedded We
 
 ## Requirements
 
+### Standard Installation
 - Python 3.9+
 - FFmpeg installed and available in PATH
 - Gladia API key (Sign up at [Gladia](https://gladia.io/))
 - Internet connection
 
+### Docker Installation
+- Docker and Docker Compose
+- Gladia API key (Sign up at [Gladia](https://gladia.io/))
+- Internet connection
+
 ## Installation
+
+### Standard Installation
 
 1. Clone this repository:
    ```
@@ -33,13 +41,66 @@ Rainscribe is a live transcription and translation tool that creates embedded We
 
 3. Ensure FFmpeg is installed on your system.
 
+### Docker Installation
+
+1. Clone this repository:
+   ```
+   git clone https://github.com/yourusername/rainscribe.git
+   cd rainscribe
+   ```
+
+2. Build the Docker image:
+   ```
+   docker build -t rainscribe .
+   ```
+
 ## Usage
+
+### Standard Usage
 
 Run the script with your Gladia API key:
 
 ```bash
 python3 rainscribe.py YOUR_GLADIA_API_KEY
 ```
+
+Then open `http://localhost:8080/index.html` in your browser to view the stream with embedded captions.
+
+### Docker Usage
+
+#### Using docker run
+
+```bash
+docker run -p 8080:8080 -v $(pwd)/output:/app/output -e GLADIA_API_KEY=your_api_key_here rainscribe
+```
+
+You can also set additional environment variables:
+
+```bash
+docker run -p 8080:8080 \
+  -v $(pwd)/output:/app/output \
+  -e GLADIA_API_KEY=your_api_key_here \
+  -e STREAM_URL=your_stream_url \
+  -e MIN_CUES=3 \
+  rainscribe
+```
+
+#### Using Docker Compose
+
+1. Set your Gladia API key as an environment variable:
+   ```bash
+   export GLADIA_API_KEY=your_api_key_here
+   ```
+
+2. (Optional) Set additional environment variables:
+   ```bash
+   export STREAM_URL=your_custom_stream_url
+   ```
+
+3. Start the container:
+   ```bash
+   docker-compose up
+   ```
 
 Then open `http://localhost:8080/index.html` in your browser to view the stream with embedded captions.
 
@@ -65,11 +126,22 @@ You can customize the following variables in `rainscribe.py`:
 - `MIN_CUES`: Minimum number of caption cues to prebuffer before starting playback
 - `STREAMING_CONFIGURATION`: Configuration for Gladia API including language settings
 
+When using Docker, you can configure the application using environment variables:
+
+| Environment Variable | Description | Default Value |
+|----------------------|-------------|---------------|
+| GLADIA_API_KEY | Your Gladia API key (required) | None |
+| STREAM_URL | URL of the HLS stream to transcribe | https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8 |
+| HTTP_PORT | Port for the HTTP server | 8080 |
+| MIN_CUES | Minimum number of cues to prebuffer | 2 |
+| OUTPUT_DIR | Directory for output files | /app/output (in Docker) |
+
 ## Troubleshooting
 
 - Make sure FFmpeg is properly installed and available in your PATH
 - Check that your Gladia API key is valid
 - For any errors, check the log file `rainscribe_run.log` created after each run
+- When using Docker, check the container logs with `docker logs` or `docker-compose logs`
 
 ## License
 

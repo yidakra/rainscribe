@@ -50,16 +50,20 @@ sys.stderr = Tee(sys.stderr, log_file)
 
 # === Configuration Constants ===
 GLADIA_API_URL = "https://api.gladia.io"
-EXAMPLE_HLS_STREAM_URL = "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
+# Allow URL override via environment variable (for Docker)
+EXAMPLE_HLS_STREAM_URL = os.environ.get(
+    "STREAM_URL", 
+    "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
+)
 
-MIN_CUES = 2  # Adjust as needed (2 works well for the example stream)
+MIN_CUES = int(os.environ.get("MIN_CUES", "2"))  # Adjust as needed (2 works well for the example stream)
 
-HTTP_PORT = 8080  # For serving index.html and HLS stream
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))  # For serving index.html and HLS stream
 
 OUTPUT_VTT_FILE = "captions.vtt"
 
 # Directory for repackaged HLS stream
-HLS_OUTPUT_DIR = "output"
+HLS_OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 
 # === Type Definitions ===
 class InitiateResponse(TypedDict):
@@ -121,9 +125,15 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
 
 def get_gladia_key() -> str:
-    """Retrieve the Gladia API key from the first command-line argument."""
+    """Retrieve the Gladia API key from the first command-line argument or environment variable."""
+    # First try environment variable (for Docker)
+    env_key = os.environ.get("GLADIA_API_KEY")
+    if env_key:
+        return env_key
+        
+    # Fallback to command line argument
     if len(sys.argv) != 2 or not sys.argv[1]:
-        print("You must provide a Gladia key as the first argument.")
+        print("You must provide a Gladia key as the first argument or set GLADIA_API_KEY environment variable.")
         sys.exit(1)
     return sys.argv[1]
 
