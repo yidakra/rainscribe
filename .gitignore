@@ -222,3 +222,17 @@ secrets/
 *.pem
 *.key
 *.crt
+
+# Generated files
+*.vtt
+output/
+*.m3u8
+*.ts
+*.log
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
