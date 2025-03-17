@@ -52,7 +52,7 @@ sys.stderr = Tee(sys.stderr, log_file)
 GLADIA_API_URL = "https://api.gladia.io"
 EXAMPLE_HLS_STREAM_URL = "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
 
-MIN_CUES = 2  # Adjust as needed
+MIN_CUES = 2  # Adjust as needed (2 works well for the example stream)
 
 HTTP_PORT = 8080  # For serving index.html and HLS stream
 
