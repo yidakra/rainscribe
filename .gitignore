@@ -94,12 +94,6 @@ ipython_config.py
 #   install all needed dependencies.
 #Pipfile.lock
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
@@ -189,16 +183,23 @@ yarn-error.log
 *.code-workspace
 .history/
 
-# rainscribe specific
-/shared-data/
-/tmp/
+# Cursor
+.cursor/
+
+# RainScribe specific
+rainscribe_output/
+rainscribe_run.log
+output/
+app_output.log
 *.m3u8
 *.ts
 *.vtt
+*.scc
 *.mp4
 *.mp3
 *.wav
 *.aac
+index.html
 
 # macOS
 .DS_Store
@@ -212,6 +213,9 @@ yarn-error.log
 # Temporary HLS and media files
 media/
 hls/
+segments/
+captions/
+temp/
 
 # Exclude secrets
 secrets/

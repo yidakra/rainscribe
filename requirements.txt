@@ -1,14 +1,4 @@
-# Core dependencies
-numpy>=1.19.5
-requests>=2.25.1
-psutil>=5.8.0
-pyyaml>=5.4.1
-
-# Optional dependencies
-py-cpuinfo>=8.0.0  # For detailed CPU information
-
-# Development dependencies
-pytest>=6.2.5
-pytest-cov>=2.12.1
-flake8>=3.9.2
-black>=21.5b2 
+websockets>=11.0.3
+requests>=2.31.0
+python-dotenv>=1.0.0
+asyncio>=3.4.3 
