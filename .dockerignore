@@ -1,10 +1,13 @@
+# Git
+.git
+.gitignore
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -16,22 +19,42 @@ lib64/
 parts/
 sdist/
 var/
+wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
-# Generated files
-*.vtt
-output/
-*.m3u8
-*.ts
-*.log
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
 
-# Git and editors
-.git/
-.github/
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# Logs and output
+*.log
+output/
+rainscribe_run.log
+
+# Docker
+.docker/
+docker-compose.override.yml
+docker-compose.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated files
+*.vtt
+*.m3u8
+*.ts
 *.swp
 *.swo
 .DS_Store 

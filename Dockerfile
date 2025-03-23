@@ -1,27 +1,41 @@
 FROM python:3.11-slim
 
-# Install ffmpeg
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Set up app directory
 WORKDIR /app
 
 # Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY rainscribe.py .
-COPY *.md ./
+# Create non-root user to run the app
+RUN groupadd -r rainscribe && \
+    useradd -r -g rainscribe rainscribe
 
-# Expose the HTTP server port
+# Create output directory with proper permissions
+RUN mkdir -p /app/output && \
+    chmod 777 /app/output && \
+    chown -R rainscribe:rainscribe /app
+
+# Copy application code
+COPY . .
+RUN chown -R rainscribe:rainscribe /app
+
+# Expose port for HTTP server
 EXPOSE 8080
 
-# Volume for generated files
-VOLUME ["/app/output"]
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV OUTPUT_DIR=/app/output
+
+# Switch to non-root user
+USER rainscribe
 
 # Run the application
-ENTRYPOINT ["python", "rainscribe.py"] 
+CMD ["python", "rainscribe.py"]
