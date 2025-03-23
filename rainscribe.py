@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Live Transcription with Embedded Caption Track for HLS Streaming using Shaka Packager
+Live Transcription with Embedded Caption Track for HLS Streaming
 
 This script does the following:
   • Initializes a live transcription session with Gladia.
   • Streams audio from an HLS URL (via FFmpeg) to Gladia's WebSocket endpoint.
-  • Receives transcription messages continuously and appends each final transcript as a WebVTT cue to an in‑memory list and a live WebVTT file.
-  • Starts a Shaka Packager process to repackage the original HLS stream into a new HLS stream.
-  • Generates a master playlist that includes an external subtitles track referencing the live‑updating WebVTT file.
+  • Receives transcription messages continuously and appends each final transcript as a WebVTT cue to an in‑memory list.
+  • Uses FFmpeg to create a new HLS stream with separate audio and video tracks.
+  • Generates a master playlist that includes the audio/video streams and external subtitles tracks.
   • Starts an HTTP server to serve the new HLS stream, the master playlist, the segments, and the live captions.
   • When you press Ctrl+C the full output of the run is saved to a log file.
 
@@ -65,10 +65,10 @@ EXAMPLE_HLS_STREAM_URL = os.environ.get(
 MIN_CUES = int(os.environ.get("MIN_CUES", "2"))  # Adjust as needed
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))  # For serving index.html and HLS stream
 
-# Directory for repackaged HLS stream
+# Directory for HLS output
 HLS_OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 
-# Shaka Packager configuration
+# HLS configuration
 SEGMENT_DURATION = "4"  # 4 seconds per segment
 WINDOW_SIZE = "5"       # 5 segments in the playlist
 
@@ -126,7 +126,6 @@ caption_cues = {
 }
 
 # Global process handles
-shaka_process = None
 ffmpeg_audio_process = None
 
 # === Utility Functions ===
@@ -197,123 +196,6 @@ async def append_vtt_cue(start: float, end: float, text: str, lang="ru"):
     
     print(f"[{lang}] Appended cue: {format_duration(start)} --> {format_duration(end)}")
     print(text.strip())
-
-# === Shaka Packager for HLS Streaming with Captions ===
-async def start_shaka_packager():
-    """
-    Use FFmpeg's native HLS output to create a live HLS stream with WebVTT captions.
-    """
-    global shaka_process
-    os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
-    
-    # Create output directories for audio and video segments
-    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "audio"), exist_ok=True)
-    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "video"), exist_ok=True)
-    
-    try:
-        # FFmpeg command to create HLS output
-        ffmpeg_command = [
-            "ffmpeg", "-y",
-            "-i", EXAMPLE_HLS_STREAM_URL,
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-map", "0:a",
-            "-f", "hls",
-            "-hls_time", SEGMENT_DURATION,
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments",
-            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "audio", "segment%d.ts"),
-            os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8"),
-            "-map", "0:v",
-            "-c:v", "copy",
-            "-f", "hls",
-            "-hls_time", SEGMENT_DURATION,
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments",
-            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "video", "segment%d.ts"),
-            os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-        ]
-
-        print("Starting FFmpeg for HLS stream...")
-        print(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
-        
-        # Start FFmpeg process
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        # Create master playlist
-        master_playlist_path = os.path.join(HLS_OUTPUT_DIR, "stream_master.m3u8")
-        master_playlist_content = """#EXTM3U
-#EXT-X-VERSION:3
-
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"
-
-#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"
-video/playlist.m3u8"""
-        
-        with open(master_playlist_path, "w") as f:
-            f.write(master_playlist_content)
-        
-        # Monitor the playlists
-        audio_playlist = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
-        video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-        timeout = 30  # 30 seconds timeout
-        start_time = time.time()
-        
-        while not (os.path.exists(audio_playlist) and os.path.exists(video_playlist)):
-            if time.time() - start_time > timeout:
-                print("Timeout waiting for playlists")
-                raise TimeoutError("Failed to generate playlists")
-            
-            # Check if FFmpeg process has failed
-            if ffmpeg_process.poll() is not None:
-                stderr = ffmpeg_process.stderr.read()
-                raise RuntimeError(f"FFmpeg process failed: {stderr}")
-            
-            await asyncio.sleep(1)
-        
-        print("HLS stream is ready")
-        
-        # Keep the process running
-        while True:
-            await asyncio.sleep(1)
-            if ffmpeg_process.poll() is not None:
-                print("FFmpeg process ended unexpectedly")
-                break
-    
-    except Exception as e:
-        print(f"Error in start_shaka_packager: {e}")
-        raise
-    
-    finally:
-        # Cleanup processes
-        if 'ffmpeg_process' in locals():
-            ffmpeg_process.terminate()
-
-async def write_master_playlist():
-    """
-    Write a custom master HLS playlist that references the Shaka-generated video stream
-    and includes the subtitles tracks for each language.
-    """
-    master_playlist = """#EXTM3U
-#EXT-X-VERSION:3
-
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/main.m3u8"
-
-#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.42e01e,mp4a.40.2",AUDIO="audio"
-video/main.m3u8
-"""
-    
-    master_playlist_path = os.path.join(HLS_OUTPUT_DIR, "stream_master.m3u8")
-    with open(master_playlist_path, "w") as f:
-        f.write(master_playlist)
-    
-    print(f"Custom master playlist written to {master_playlist_path}")
 
 # === FastAPI Server for Serving HLS Stream and Captions ===
 app = FastAPI()
@@ -638,46 +520,28 @@ async def generate_index_html():
                 const lang = data.language;
                 const cues = data.cues;
                 
-                // Create a new track with updated cues
-                const oldTrack = document.getElementById('subtitles-' + lang);
-                if (oldTrack) {{
-                    // Create VTT content
-                    const vttContent = 'WEBVTT\\n\\n' + cues.map(cue => 
-                        format_duration(cue.start) + ' --> ' + format_duration(cue.end) + '\\n' + cue.text + '\\n\\n'
-                    ).join('');
-                    
-                    // Create blob and update track
-                    const blob = new Blob([vttContent], {{ type: 'text/vtt' }});
-                    const blobUrl = URL.createObjectURL(blob);
-                    
-                    // Store the previous mode
-                    const wasShowing = oldTrack.track.mode === 'showing';
-                    
-                    // Create and configure new track
-                    const newTrack = document.createElement('track');
-                    newTrack.id = 'subtitles-' + lang;
-                    newTrack.kind = 'subtitles';
-                    newTrack.label = lang === 'ru' ? 'Russian' : (lang === 'en' ? 'English' : 'Dutch');
-                    newTrack.srclang = lang;
-                    newTrack.src = blobUrl;
-                    
-                    // Replace the track
-                    oldTrack.parentNode.replaceChild(newTrack, oldTrack);
-                    
-                    // Restore the mode if it was previously showing
-                    if (wasShowing) {{
-                        setTimeout(() => {{
-                            newTrack.track.mode = 'showing';
-                        }}, 50);
-                    }} else {{
-                        newTrack.track.mode = 'hidden';
-                    }}
-                    
-                    // Clean up old blob URL
-                    if (oldTrack.src.startsWith('blob:')) {{
-                        URL.revokeObjectURL(oldTrack.src);
-                    }}
+                // Get the video track for this language
+                const track = Array.from(video.textTracks).find(t => t.language === lang);
+                if (!track) return;
+                
+                // Clear existing cues to prevent duplicates
+                while (track.cues && track.cues.length) {{
+                    track.removeCue(track.cues[0]);
                 }}
+                
+                // Add new cues using the native TextTrack API
+                cues.forEach(cue => {{
+                    try {{
+                        const vttCue = new VTTCue(
+                            parseFloat(cue.start),
+                            parseFloat(cue.end),
+                            cue.text
+                        );
+                        track.addCue(vttCue);
+                    }} catch (e) {{
+                        console.error('Error adding cue:', e);
+                    }}
+                }});
                 
                 document.getElementById('update-status').textContent = 
                     'Updated at ' + new Date().toLocaleTimeString();
@@ -836,15 +700,13 @@ async def stop_recording(websocket: WebSocketClientProtocol) -> None:
     # Clean up processes
     if ffmpeg_audio_process:
         ffmpeg_audio_process.terminate()
-    if shaka_process:
-        shaka_process.terminate()
 
 # === Main Transcription Flow with Prebuffering ===
 async def transcription_main():
     """
     Start transcription by connecting to Gladia.
     Prebuffer until at least MIN_CUES caption cues are available,
-    then start the HTTP server and Shaka Packager for HLS streaming.
+    then start the HTTP server and FFmpeg for HLS streaming.
     """
     print("\nTranscribing audio and outputting live WebVTT captions with translations.")
     
@@ -857,8 +719,8 @@ async def transcription_main():
     # Initialize fresh VTT files
     await write_vtt_header()
     
-    # Start Shaka Packager process
-    packager_task = asyncio.create_task(start_shaka_packager())
+    # Start FFmpeg process for HLS output
+    packager_task = asyncio.create_task(start_ffmpeg_hls())
     
     # Initialize Gladia session
     response = init_live_session(STREAMING_CONFIGURATION)
@@ -903,8 +765,102 @@ async def transcription_main():
             # Clean up
             if ffmpeg_audio_process:
                 ffmpeg_audio_process.terminate()
-            if shaka_process:
-                shaka_process.terminate()
+
+# === FFmpeg HLS Output ===
+async def start_ffmpeg_hls():
+    """
+    Use FFmpeg's native HLS output to create a live HLS stream with separate audio and video tracks.
+    """
+    os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
+    
+    # Create output directories for audio and video segments
+    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "audio"), exist_ok=True)
+    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "video"), exist_ok=True)
+    
+    try:
+        # FFmpeg command to create HLS output
+        ffmpeg_command = [
+            "ffmpeg", "-y",
+            "-i", EXAMPLE_HLS_STREAM_URL,
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-map", "0:a",
+            "-f", "hls",
+            "-hls_time", SEGMENT_DURATION,
+            "-hls_list_size", "5",
+            "-hls_flags", "delete_segments",
+            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "audio", "segment%d.ts"),
+            os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8"),
+            "-map", "0:v",
+            "-c:v", "copy",
+            "-f", "hls",
+            "-hls_time", SEGMENT_DURATION,
+            "-hls_list_size", "5",
+            "-hls_flags", "delete_segments",
+            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "video", "segment%d.ts"),
+            os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+        ]
+
+        print("Starting FFmpeg for HLS stream...")
+        print(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
+        
+        # Start FFmpeg process
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Create master playlist
+        master_playlist_path = os.path.join(HLS_OUTPUT_DIR, "stream_master.m3u8")
+        master_playlist_content = """#EXTM3U
+#EXT-X-VERSION:3
+
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"
+
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio"
+video/playlist.m3u8"""
+        
+        with open(master_playlist_path, "w") as f:
+            f.write(master_playlist_content)
+        
+        # Monitor the playlists
+        audio_playlist = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
+        video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+        timeout = 30  # 30 seconds timeout
+        start_time = time.time()
+        
+        while not (os.path.exists(audio_playlist) and os.path.exists(video_playlist)):
+            if time.time() - start_time > timeout:
+                print("Timeout waiting for playlists")
+                raise TimeoutError("Failed to generate playlists")
+            
+            # Check if FFmpeg process has failed
+            if ffmpeg_process.poll() is not None:
+                stderr = ffmpeg_process.stderr.read()
+                raise RuntimeError(f"FFmpeg process failed: {stderr}")
+            
+            await asyncio.sleep(1)
+        
+        print("HLS stream is ready")
+        
+        # Keep the process running
+        while True:
+            await asyncio.sleep(1)
+            if ffmpeg_process.poll() is not None:
+                print("FFmpeg process ended unexpectedly")
+                break
+    
+    except Exception as e:
+        print(f"Error in start_ffmpeg_hls: {e}")
+        raise
+    
+    finally:
+        # Cleanup processes
+        if 'ffmpeg_process' in locals():
+            ffmpeg_process.terminate()
 
 if __name__ == "__main__":
     try:
@@ -913,6 +869,4 @@ if __name__ == "__main__":
         print("\nShutting down gracefully...")
         if ffmpeg_audio_process:
             ffmpeg_audio_process.terminate()
-        if shaka_process:
-            shaka_process.terminate()
         sys.exit(0)

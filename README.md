@@ -1,6 +1,6 @@
 # Rainscribe
 
-Live transcription with embedded caption track for HLS streaming in a Docker container.
+Live transcription with embedded caption track for HLS streaming.
 
 ## Features
 
@@ -8,7 +8,7 @@ Live transcription with embedded caption track for HLS streaming in a Docker con
 - Streams audio from an HLS URL (via FFmpeg) to Gladia's WebSocket endpoint
 - Receives transcription messages continuously and appends each final transcript as a WebVTT cue
 - Uses FFmpeg to create HLS output with separate audio and video streams
-- Generates a master playlist that includes external subtitles tracks for multiple languages
+- Generates a master playlist that includes the audio/video streams and external subtitles tracks
 - Serves the HLS stream, master playlist, segments, and live captions via a FastAPI server
 - Supports multiple languages (Russian + English and Dutch translations)
 - Real-time caption updates via WebSocket
