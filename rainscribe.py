@@ -108,13 +108,24 @@ STREAMING_CONFIGURATION = {
 def format_duration(seconds: float) -> str:
     """Format seconds into WebVTT time format: HH:MM:SS.mmm"""
     if isinstance(seconds, str):
-        return seconds  # Already formatted
+        # Handle epoch-based timestamps (e.g., "4841161:17:30.000")
+        if ":" in seconds and len(seconds.split(":")) > 2:
+            # Extract just the MM:SS.mmm part from the end
+            parts = seconds.split(":")
+            seconds = float(parts[-2]) * 60 + float(parts[-1])
     
-    milliseconds = int(seconds * 1000)
+    # Convert to milliseconds
+    milliseconds = int(float(seconds) * 1000)
+    
+    # Calculate hours, minutes, seconds
     hours = milliseconds // 3600000
     minutes = (milliseconds % 3600000) // 60000
     secs = (milliseconds % 60000) // 1000
     ms = milliseconds % 1000
+    
+    # Keep hours reasonable for WebVTT (max 99)
+    hours = hours % 100
+    
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
 
 def get_gladia_key() -> str:
@@ -145,74 +156,72 @@ def init_live_session(config: Dict[str, Any]) -> Dict[str, str]:
 async def create_vtt_segment(segment_number, language="ru"):
     """
     Create a WebVTT segment file for the given segment number and language.
-    Each segment covers a specified duration of time.
+    Each segment covers a specified duration of time based on stream-relative timing.
     """
-    global stream_start_time
-    
-    # Create directory structure
     subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", language)
     os.makedirs(subtitle_dir, exist_ok=True)
     
     try:
-        # Get the current video segment number and media sequence
+        # Get current video segment info
         video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
         media_sequence = 0
-        first_segment = None
         
         if os.path.exists(video_playlist):
             with open(video_playlist, 'r') as f:
                 for line in f:
                     if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
                         media_sequence = int(line.strip().split(":")[1])
-                    elif line.strip().endswith(".ts"):
-                        if first_segment is None:
-                            first_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
-                            if stream_start_time is None:
-                                stream_start_time = first_segment
-        
-        if first_segment is None or stream_start_time is None:
+                        break
+
+        if stream_start_time is None:
             return False
             
-        # Calculate relative time for this segment
-        segment_relative_start = (segment_number - stream_start_time) * SEGMENT_DURATION
-        segment_relative_end = segment_relative_start + SEGMENT_DURATION
-        
-        # Use the video segment number for VTT segment
-        segment_path = os.path.join(subtitle_dir, f"segment{segment_number}.vtt")
+        # Calculate segment boundaries in stream-relative time
+        segment_index = segment_number - stream_start_time
+        segment_start = segment_index * SEGMENT_DURATION
+        segment_end = segment_start + SEGMENT_DURATION
         
         # Create WebVTT content
         content = "WEBVTT\n\n"
-        
-        # Find cues that overlap with this segment
         relevant_cues = []
+        
         for cue in caption_cues[language]:
             cue_start = float(cue["start"])
             cue_end = float(cue["end"])
             
-            # Check if this cue overlaps with the current segment
-            if cue_end > segment_relative_start and cue_start < segment_relative_end:
-                # Adjust timestamps to be relative to segment start
-                adjusted_start = max(0, cue_start - segment_relative_start)
-                adjusted_end = min(SEGMENT_DURATION, cue_end - segment_relative_start)
+            # Check if cue overlaps with this segment's time window
+            if cue_end > segment_start and cue_start < segment_end:
+                # Calculate relative times within segment
+                adjusted_start = max(0, cue_start - segment_start)
+                adjusted_end = min(SEGMENT_DURATION, cue_end - segment_start)
+                
+                # Skip zero-duration cues
+                if adjusted_end - adjusted_start <= 0:
+                    continue
                 
                 relevant_cues.append({
                     "start": adjusted_start,
                     "end": adjusted_end,
                     "text": cue["text"]
                 })
-        
+
         # Add cues to content
-        for cue in relevant_cues:
-            content += f"{format_duration(cue['start'])} --> {format_duration(cue['end'])}\n{cue['text']}\n\n"
-        
-        # Write segment file
+        for i, cue in enumerate(relevant_cues):
+            content += f"{i+1}\n"
+            content += f"{format_duration(cue['start'])} --> {format_duration(cue['end'])}\n"
+            content += f"{cue['text']}\n\n"
+
+        # Always write the segment file, even if empty
+        segment_path = os.path.join(subtitle_dir, f"segment{segment_number}.vtt")
         async with aiofiles.open(segment_path, "w", encoding="utf-8") as f:
             await f.write(content)
+            
+        print(f"Created {language} segment {segment_number} with {len(relevant_cues)} cues")
         
-        return len(relevant_cues) > 0  # Return True if segment contains cues
+        return True
         
     except Exception as e:
-        print(f"Error in create_vtt_segment: {e}")
+        print(f"Error in create_vtt_segment: {str(e)}")
         return False
 
 async def update_subtitle_playlist(language="ru"):
@@ -222,55 +231,34 @@ async def update_subtitle_playlist(language="ru"):
     subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", language)
     os.makedirs(subtitle_dir, exist_ok=True)
     playlist_path = os.path.join(subtitle_dir, "playlist.m3u8")
-    
-    # Get the current video segment number and media sequence
+
+    # Get video playlist state
     video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-    current_segment = None
     media_sequence = 0
+    segments = []
     
     if os.path.exists(video_playlist):
         with open(video_playlist, 'r') as f:
             for line in f:
-                if line.strip().endswith(".ts"):
-                    current_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
-                elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
                     media_sequence = int(line.strip().split(":")[1])
-    
-    if current_segment is None:
-        return
-    
-    # Get list of segment files that match the video segments
-    segments = []
-    if os.path.exists(subtitle_dir):
-        for file in os.listdir(subtitle_dir):
-            if file.startswith("segment") and file.endswith(".vtt"):
-                try:
-                    segment_num = int(file.replace("segment", "").replace(".vtt", ""))
-                    if segment_num >= media_sequence:
-                        segments.append((segment_num, file))
-                except ValueError:
-                    continue
-    
-    # Sort segments by number
-    segments.sort()
-    
-    # Only keep the most recent WINDOW_SIZE segments
-    if len(segments) > WINDOW_SIZE:
-        segments = segments[-WINDOW_SIZE:]
-    
-    # Create playlist content
-    content = "#EXTM3U\n"
-    content += "#EXT-X-VERSION:3\n"
+                elif line.strip().endswith(".ts"):
+                    seg_num = int(line.strip().replace("segment", "").replace(".ts", ""))
+                    segments.append(seg_num)
+
+    # Create matching subtitle playlist
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
     content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
     content += f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"
-    
-    for _, file in segments:
+
+    for seg_num in segments[-WINDOW_SIZE:]:
         content += f"#EXTINF:{SEGMENT_DURATION}.0,\n"
-        content += f"{file}\n"
-    
-    # Write playlist file
+        content += f"segment{seg_num}.vtt\n"
+
     async with aiofiles.open(playlist_path, "w", encoding="utf-8") as f:
         await f.write(content)
+    
+    print(f"Updated {language} subtitle playlist (media_sequence: {media_sequence})")
 
 async def create_master_playlist():
     """
@@ -307,89 +295,114 @@ async def monitor_segments_and_create_vtt():
     """
     Monitor HLS video segments and create corresponding VTT segments.
     """
+    global stream_start_time
     video_segment_dir = os.path.join(HLS_OUTPUT_DIR, "video")
-    last_processed_segment = None
-    
-    # Initialize subtitles directories
-    for lang in caption_cues.keys():
-        subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang)
-        os.makedirs(subtitle_dir, exist_ok=True)
+    processed_segments = set()
     
     while True:
         try:
             # Get current video segment from playlist
             video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-            current_segment = None
-            
-            if os.path.exists(video_playlist):
-                with open(video_playlist, 'r') as f:
-                    for line in f:
-                        if line.strip().endswith(".ts"):
-                            current_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
+            if not os.path.exists(video_playlist):
+                await asyncio.sleep(1)
+                continue
+
+            # Parse current segments from video playlist
+            current_segments = []
+            media_sequence = 0
+            with open(video_playlist, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                        media_sequence = int(line.split(":")[1])
+                    elif line.endswith(".ts"):
+                        seg_num = int(line.replace("segment", "").replace(".ts", ""))
+                        current_segments.append(seg_num)
+                        # Initialize stream_start_time with first segment if not set
+                        if stream_start_time is None:
+                            stream_start_time = seg_num
+                            print(f"Initialized stream_start_time: {stream_start_time}")
                             break
-            
-            if current_segment is not None and current_segment != last_processed_segment:
-                # Process new segment using the video segment number
-                for lang in caption_cues.keys():
-                    await create_vtt_segment(current_segment, lang)
-                    await update_subtitle_playlist(lang)
-                
-                last_processed_segment = current_segment
-            
-            # Short wait before checking again
-            await asyncio.sleep(1)
-        
+
+            # Process all segments in the current window
+            for seg_num in current_segments:
+                if seg_num not in processed_segments:
+                    for lang in caption_cues.keys():
+                        created = await create_vtt_segment(seg_num, lang)
+                        if created:
+                            await update_subtitle_playlist(lang)
+                    processed_segments.add(seg_num)
+                    
+            # Clean up old segments beyond window size
+            if current_segments:
+                min_segment = min(current_segments)
+                processed_segments = {s for s in processed_segments if s >= min_segment}
+
+            await asyncio.sleep(0.5)
+
         except Exception as e:
-            print(f"Error in monitor_segments_and_create_vtt: {e}")
+            print(f"Segment monitoring error: {str(e)}")
             await asyncio.sleep(2)  # Wait a bit longer if there was an error
 
-async def append_vtt_cue(start: float, end: float, text: str, lang="ru"):
+async def append_vtt_cue(language, start_time, end_time, text):
     """
-    Append a WebVTT cue to the in-memory list and update segment files.
+    Append a new cue to the caption_cues list for the specified language.
+    Timestamps should be in seconds relative to stream start.
     """
-    global stream_start_time
-    
-    cue = {
-        "start": start,
-        "end": end,
-        "text": text.strip()
-    }
-    caption_cues[lang].append(cue)
-    
-    # Get current video segment number and media sequence
-    video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-    current_segment = None
-    media_sequence = 0
-    first_segment = None
-    
-    if os.path.exists(video_playlist):
-        with open(video_playlist, 'r') as f:
-            for line in f:
-                if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                    media_sequence = int(line.strip().split(":")[1])
-                elif line.strip().endswith(".ts"):
-                    if first_segment is None:
-                        first_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
-                        if stream_start_time is None:
-                            stream_start_time = first_segment
-                    current_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
-    
-    if current_segment is not None and stream_start_time is not None:
-        # Calculate which segments this cue affects
-        start_segment = stream_start_time + int(start / SEGMENT_DURATION)
-        end_segment = stream_start_time + int(end / SEGMENT_DURATION)
+    try:
+        # Convert epoch-based timestamps to seconds if needed
+        if isinstance(start_time, str) and ":" in start_time:
+            start_time = float(start_time.split(":")[-1])  # Take seconds part
+        if isinstance(end_time, str) and ":" in end_time:
+            end_time = float(end_time.split(":")[-1])  # Take seconds part
+            
+        start_time = float(start_time)
+        end_time = float(end_time)
         
-        # Only update segments that are within the current window
-        start_segment = max(start_segment, media_sequence)
-        end_segment = min(end_segment, current_segment)
+        # Ensure we have valid timestamps
+        if end_time <= start_time:
+            print(f"Invalid timestamps: {start_time} -> {end_time}")
+            return
+            
+        caption_cues[language].append({
+            "start": start_time,
+            "end": end_time,
+            "text": text
+        })
         
-        # Update affected segments
-        for segment_num in range(start_segment, end_segment + 1):
-            await create_vtt_segment(segment_num, lang)
-            await update_subtitle_playlist(lang)
-    
-    print(f"[{lang}] Added cue: {format_duration(start)} --> {format_duration(end)}")
-    print(text.strip())
+        # Get current video segment number and media sequence
+        video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+        current_segment = None
+        media_sequence = 0
+        
+        if os.path.exists(video_playlist):
+            with open(video_playlist, 'r') as f:
+                for line in f:
+                    if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                        media_sequence = int(line.strip().split(":")[1])
+                    elif line.strip().endswith(".ts"):
+                        current_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
+        
+        if current_segment is not None:
+            # Calculate which segments this cue affects
+            start_segment = int(start_time / SEGMENT_DURATION)
+            end_segment = int(end_time / SEGMENT_DURATION)
+            
+            # Only update segments that are within the current window
+            start_segment = max(start_segment, media_sequence)
+            end_segment = min(end_segment, current_segment)
+            
+            # Update affected segments
+            for segment_num in range(start_segment, end_segment + 1):
+                await create_vtt_segment(segment_num, language)
+                await update_subtitle_playlist(language)
+        
+        print(f"[{language}] Added cue: {format_duration(start_time)} --> {format_duration(end_time)}")
+        print(text)
+        
+    except Exception as e:
+        print(f"Error in append_vtt_cue: {str(e)}")
+        print(f"Failed to append cue: {start_time} -> {end_time}: {text}")
 
 # === FastAPI Server ===
 app = FastAPI()
@@ -752,28 +765,39 @@ async def process_messages_from_socket(socket: WebSocketClientProtocol) -> None:
     Process transcription and translation messages from Gladia.
     For each final transcript and translation, create corresponding VTT segments.
     """
-    # Log the first message of each type to understand the structure
-    seen_types = set()
+    first_transcript_time = None
+    video_start_segment = None
     
     async for message in socket:
         content = json.loads(message)
         msg_type = content["type"]
         
-        # Log first instance of each message type for debugging
-        if DEBUG_MESSAGES and msg_type not in seen_types:
-            seen_types.add(msg_type)
-            print(f"\nFIRST EXAMPLE OF {msg_type.upper()} MESSAGE:")
-            print(json.dumps(content, indent=2, ensure_ascii=False))
-            print("\n")
-            
         # Handle original transcription
         if msg_type == "transcript" and content["data"]["is_final"]:
             utterance = content["data"]["utterance"]
             start = utterance["start"]
             end = utterance["end"]
             text = utterance["text"].strip()
-            print(f"[Original] {format_duration(start)} --> {format_duration(end)} | {text}")
-            await append_vtt_cue(start, end, text, "ru")
+            
+            # Initialize timing reference
+            if first_transcript_time is None:
+                first_transcript_time = start
+                # Get current video segment
+                video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+                if os.path.exists(video_playlist):
+                    with open(video_playlist, 'r') as f:
+                        for line in f:
+                            if line.strip().endswith(".ts"):
+                                video_start_segment = int(line.strip().replace("segment", "").replace(".ts", ""))
+                                break
+                print(f"First transcript at {start}s, video segment {video_start_segment}")
+            
+            # Calculate stream-relative timestamps
+            stream_relative_start = start - first_transcript_time
+            stream_relative_end = end - first_transcript_time
+            
+            print(f"[Original] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+            await append_vtt_cue("ru", stream_relative_start, stream_relative_end, text)
             
         # Handle translations
         elif msg_type == "translation":
@@ -790,9 +814,13 @@ async def process_messages_from_socket(socket: WebSocketClientProtocol) -> None:
                     text = translated_utterance["text"].strip()
                     lang = content["data"]["target_language"]
                     
+                    # Calculate stream-relative timestamps
+                    stream_relative_start = start - first_transcript_time
+                    stream_relative_end = end - first_transcript_time
+                    
                     if lang in ["en", "nl"]:
-                        print(f"[{lang.upper()}] {format_duration(start)} --> {format_duration(end)} | {text}")
-                        await append_vtt_cue(start, end, text, lang)
+                        print(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                        await append_vtt_cue(lang, stream_relative_start, stream_relative_end, text)
                         
                 # Format 2: Other formats - kept for fallback compatibility
                 elif "translation" in content["data"]:
@@ -805,11 +833,15 @@ async def process_messages_from_socket(socket: WebSocketClientProtocol) -> None:
                         start = content["data"]["start"]
                         end = content["data"]["end"]
                     
+                    # Calculate stream-relative timestamps
+                    stream_relative_start = start - first_transcript_time
+                    stream_relative_end = end - first_transcript_time
+                    
                     text = translation["text"].strip()
                     lang = translation["target_language"]
                     if lang in ["en", "nl"]:
-                        print(f"[{lang.upper()}] {format_duration(start)} --> {format_duration(end)} | {text}")
-                        await append_vtt_cue(start, end, text, lang)
+                        print(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                        await append_vtt_cue(lang, stream_relative_start, stream_relative_end, text)
                 
                 # Handle any other formats
                 else:
