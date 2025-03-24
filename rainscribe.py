@@ -162,23 +162,13 @@ async def create_vtt_segment(segment_number, language="ru"):
     os.makedirs(subtitle_dir, exist_ok=True)
     
     try:
-        # Get current video segment info
-        video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-        media_sequence = 0
-        
-        if os.path.exists(video_playlist):
-            with open(video_playlist, 'r') as f:
-                for line in f:
-                    if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                        media_sequence = int(line.strip().split(":")[1])
-                        break
-
         if stream_start_time is None:
             return False
             
-        # Calculate segment boundaries in stream-relative time
-        segment_index = segment_number - stream_start_time
-        segment_start = segment_index * SEGMENT_DURATION
+        # Calculate segment time boundaries
+        # Convert segment number to stream-relative time
+        segment_relative_index = segment_number - stream_start_time
+        segment_start = segment_relative_index * SEGMENT_DURATION
         segment_end = segment_start + SEGMENT_DURATION
         
         # Create WebVTT content
@@ -216,7 +206,7 @@ async def create_vtt_segment(segment_number, language="ru"):
         async with aiofiles.open(segment_path, "w", encoding="utf-8") as f:
             await f.write(content)
             
-        print(f"Created {language} segment {segment_number} with {len(relevant_cues)} cues")
+        print(f"Created {language} segment {segment_number} with {len(relevant_cues)} cues (time window: {format_duration(segment_start)}-{format_duration(segment_end)})")
         
         return True
         
@@ -298,6 +288,7 @@ async def monitor_segments_and_create_vtt():
     global stream_start_time
     video_segment_dir = os.path.join(HLS_OUTPUT_DIR, "video")
     processed_segments = set()
+    last_media_sequence = None
     
     while True:
         try:
@@ -318,25 +309,43 @@ async def monitor_segments_and_create_vtt():
                     elif line.endswith(".ts"):
                         seg_num = int(line.replace("segment", "").replace(".ts", ""))
                         current_segments.append(seg_num)
-                        # Initialize stream_start_time with first segment if not set
-                        if stream_start_time is None:
-                            stream_start_time = seg_num
-                            print(f"Initialized stream_start_time: {stream_start_time}")
-                            break
 
+            # Initialize stream_start_time with first segment if not set
+            if stream_start_time is None and current_segments:
+                stream_start_time = current_segments[0]
+                print(f"Initialized stream_start_time: {stream_start_time}")
+            
+            # If media sequence changed, we need to update all segments
+            if last_media_sequence != media_sequence:
+                print(f"Media sequence changed from {last_media_sequence} to {media_sequence}")
+                processed_segments.clear()
+                last_media_sequence = media_sequence
+            
             # Process all segments in the current window
             for seg_num in current_segments:
                 if seg_num not in processed_segments:
                     for lang in caption_cues.keys():
+                        # Create VTT segment
                         created = await create_vtt_segment(seg_num, lang)
                         if created:
                             await update_subtitle_playlist(lang)
+                            print(f"Updated {lang} segment {seg_num} and playlist")
                     processed_segments.add(seg_num)
-                    
+            
             # Clean up old segments beyond window size
             if current_segments:
                 min_segment = min(current_segments)
                 processed_segments = {s for s in processed_segments if s >= min_segment}
+                
+                # Also clean up old VTT files
+                for lang in caption_cues.keys():
+                    subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang)
+                    if os.path.exists(subtitle_dir):
+                        for file in os.listdir(subtitle_dir):
+                            if file.startswith("segment") and file.endswith(".vtt"):
+                                seg_num = int(file.replace("segment", "").replace(".vtt", ""))
+                                if seg_num < min_segment:
+                                    os.remove(os.path.join(subtitle_dir, file))
 
             await asyncio.sleep(0.5)
 
