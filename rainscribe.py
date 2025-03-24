@@ -3,10 +3,16 @@
 Live Transcription with Native HLS Subtitle Integration for HLS Streaming
 
 Improvements:
-- Uses native HLS subtitle capabilities instead of WebSockets
+- Extracts audio from HLS stream using FFmpeg and streams it to Gladia API
+- Receives real-time transcriptions and translations via WebSocket
 - Creates segmented WebVTT files that align with HLS segments
+- Uses native HLS subtitle capabilities instead of WebSockets for playback
 - Provides proper subtitle synchronization for viewers joining mid-stream
+- Maintains a sliding window of subtitle segments to match video segments
+- Supports multiple languages (Russian + English and Dutch translations)
 - Simplified player interface relying on native caption features
+- Handles epoch-based segment numbering for proper timing alignment
+- Automatically cleans up old segments to prevent disk space issues
 """
 
 import asyncio
