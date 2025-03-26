@@ -2,17 +2,13 @@
 """
 Live Transcription with Native HLS Subtitle Integration for HLS Streaming
 
-Improvements:
-- Extracts audio from HLS stream using FFmpeg and streams it to Gladia API
-- Receives real-time transcriptions and translations via WebSocket
-- Creates segmented WebVTT files that align with HLS segments
-- Uses native HLS subtitle capabilities instead of WebSockets for playback
-- Provides proper subtitle synchronization for viewers joining mid-stream
-- Maintains a sliding window of subtitle segments to match video segments
-- Supports multiple languages (Russian + English and Dutch translations)
-- Simplified player interface relying on native caption features
-- Handles epoch-based segment numbering for proper timing alignment
-- Automatically cleans up old segments to prevent disk space issues
+This implementation incorporates methodological improvements for multimedia buffering and parallel processing:
+- Systematic collection of 6 10-second audio and video segments prior to stream initiation
+- Parallel audio transcription via isolated processing channel to Gladia API
+- Synchronized generation of WebVTT segments corresponding to buffered media segments
+- Stream commencement from earliest buffered segment after 60-second initialization period
+- Continuous media segment accumulation with corresponding caption alignment
+- Optimized resource management for sustained operational integrity
 """
 
 import asyncio
@@ -31,66 +27,65 @@ from websockets.exceptions import ConnectionClosedOK
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 import uvicorn
+import logging
 
-# === Logging Setup ===
-class Tee:
-    def __init__(self, *files):
-        self.files = files
-    def write(self, data):
-        for f in self.files:
-            f.write(data)
-            f.flush()
-    def flush(self):
-        for f in self.files:
-            f.flush()
-    def isatty(self):
-        return False
-
-LOG_FILENAME = "rainscribe_run.log"
-log_file = open(LOG_FILENAME, "w", encoding="utf-8")
-sys.stdout = Tee(sys.stdout, log_file)
-sys.stderr = Tee(sys.stderr, log_file)
+# === Configure Logging ===
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("logs/rainscribe.log", mode="w"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("rainscribe")
 
 # === Configuration Constants ===
 GLADIA_API_URL = "https://api.gladia.io"
-EXAMPLE_HLS_STREAM_URL = os.environ.get(
+STREAM_URL = os.environ.get(
     "STREAM_URL", 
     "https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8"
 )
 
-MIN_CUES = int(os.environ.get("MIN_CUES", "2"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-
-# Directory for HLS output
-HLS_OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
-
-# HLS configuration
-SEGMENT_DURATION = int(os.environ.get("SEGMENT_DURATION", "10"))  # 10 seconds per segment
-WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "6"))            # 5 segments in the playlist
-
-# Debug flag
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
+SEGMENT_DURATION = int(os.environ.get("SEGMENT_DURATION", "10"))
+WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "6"))
 DEBUG_MESSAGES = os.environ.get("DEBUG_MESSAGES", "false").lower() == "true"
 
-# === Global In-Memory Storage for Caption Cues ===
-# Modified to use deque with max length to prevent memory leaks in 24/7 streaming
-MAX_CUES_PER_LANGUAGE = 1000  # Adjust as needed
+# Constants for multimedia buffer initialization
+REQUIRED_BUFFER_SEGMENTS = 6  # Number of segments required before stream initialization
+SEGMENT_BUFFER_SECONDS = SEGMENT_DURATION * REQUIRED_BUFFER_SEGMENTS  # 60 seconds with 10-second segments
+TRANSCRIPTION_BUFFER_MIN = 3  # Minimum number of transcriptions needed (relaxed from 6 to ensure startup)
+
+# Directory structure
+HLS_OUTPUT_DIR = OUTPUT_DIR
+VIDEO_DIR = os.path.join(HLS_OUTPUT_DIR, "video")
+AUDIO_DIR = os.path.join(HLS_OUTPUT_DIR, "audio")
+SUBTITLE_BASE_DIR = os.path.join(HLS_OUTPUT_DIR, "subtitles")
+
+# === Global State Management ===
+# Caption storage with controlled memory usage (prevents memory leaks for 24/7 operation)
+MAX_CUES_PER_LANGUAGE = 1000
 caption_cues = {
     "ru": deque(maxlen=MAX_CUES_PER_LANGUAGE),  # Original Russian captions
     "en": deque(maxlen=MAX_CUES_PER_LANGUAGE),  # English translations
     "nl": deque(maxlen=MAX_CUES_PER_LANGUAGE)   # Dutch translations
 }
 
-# Global process handles
-ffmpeg_audio_process = None
-stream_start_time = None  # Track when the stream started
-transcription_start_time = None  # Track when transcription started
-first_segment_timestamp = None  # First video segment timestamp
-segment_counter = 0  # Counter for segment processing
+# Process and timing management
+ffmpeg_processes = {}
+stream_start_time = None
+transcription_start_time = None
+first_segment_timestamp = None
+segment_time_offset = None
 
-# Add new global variable
-segment_time_offset = None  # Tracks time offset between transcription and segments
+# Synchronization status
+ready_to_serve = False
+initialization_complete = False
 
-# === Streaming Configuration ===
+# === Streaming Configuration for Gladia ===
 STREAMING_CONFIGURATION = {
     "encoding": "wav/pcm",
     "sample_rate": 16000,
@@ -104,7 +99,7 @@ STREAMING_CONFIGURATION = {
         "words_accurate_timestamps": True,
         "custom_vocabulary": True,
         "custom_vocabulary_config": {
-            "vocabulary": ["Example", "Custom", "Words"]
+            "vocabulary": ["tvrain", "дождь", "телеканал", "россия", "украина", "москва", "санкт-петербург"]
         },
         "translation": True,
         "translation_config": {
@@ -114,33 +109,6 @@ STREAMING_CONFIGURATION = {
 }
 
 # === Utility Functions ===
-def format_duration(seconds: float) -> str:
-    """Format seconds into WebVTT time format: HH:MM:SS.mmm"""
-    if isinstance(seconds, str):
-        # Handle epoch-based timestamps (e.g., "4841161:17:30.000")
-        if ":" in seconds and len(seconds.split(":")) > 2:
-            # Extract just the MM:SS.mmm part from the end
-            parts = seconds.split(":")
-            seconds = float(parts[-2]) * 60 + float(parts[-1])
-    
-    # Convert to milliseconds
-    try:
-        milliseconds = int(float(seconds) * 1000)
-    except (ValueError, TypeError):
-        print(f"Invalid timestamp value: {seconds}")
-        milliseconds = 0
-    
-    # Calculate hours, minutes, seconds
-    hours = milliseconds // 3600000
-    minutes = (milliseconds % 3600000) // 60000
-    secs = (milliseconds % 60000) // 1000
-    ms = milliseconds % 1000
-    
-    # Keep hours reasonable for WebVTT (max 99)
-    hours = hours % 100
-    
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
-
 def get_gladia_key() -> str:
     """Retrieve the Gladia API key from environment or command-line."""
     env_key = os.environ.get("GLADIA_API_KEY")
@@ -148,53 +116,508 @@ def get_gladia_key() -> str:
         return env_key
         
     if len(sys.argv) != 2 or not sys.argv[1]:
-        print("You must provide a Gladia key as the first argument or set GLADIA_API_KEY environment variable.")
+        logger.error("You must provide a Gladia key as the first argument or set GLADIA_API_KEY environment variable.")
         sys.exit(1)
     return sys.argv[1]
+
+def format_duration(seconds: float) -> str:
+    """Format seconds into WebVTT time format: HH:MM:SS.mmm"""
+    try:
+        if isinstance(seconds, str):
+            # Handle epoch-based timestamps
+            if ":" in seconds and len(seconds.split(":")) > 2:
+                parts = seconds.split(":")
+                seconds = float(parts[-2]) * 60 + float(parts[-1])
+        
+        milliseconds = int(float(seconds) * 1000)
+        hours = milliseconds // 3600000
+        minutes = (milliseconds % 3600000) // 60000
+        secs = (milliseconds % 60000) // 1000
+        ms = milliseconds % 1000
+        
+        # Keep hours reasonable for WebVTT (max 99)
+        hours = hours % 100
+        
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid timestamp value: {seconds}. Error: {e}")
+        return "00:00:00.000"
 
 def init_live_session(config: Dict[str, Any]) -> Dict[str, str]:
     """Initialize a live transcription session with the Gladia API."""
     gladia_key = get_gladia_key()
-    response = requests.post(
-        f"{GLADIA_API_URL}/v2/live",
-        headers={"X-Gladia-Key": gladia_key},
-        json=config,
-        timeout=3,
-    )
-    if not response.ok:
-        print(f"{response.status_code}: {response.text or response.reason}")
-        sys.exit(response.status_code)
-    return response.json()
+    logger.info("Initializing Gladia live transcription session")
+    try:
+        response = requests.post(
+            f"{GLADIA_API_URL}/v2/live",
+            headers={"X-Gladia-Key": gladia_key},
+            json=config,
+            timeout=10,
+        )
+        if not response.ok:
+            logger.error(f"Gladia API error: {response.status_code}: {response.text or response.reason}")
+            sys.exit(response.status_code)
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to initialize Gladia session: {e}")
+        sys.exit(1)
 
 def normalize_segment_number(segment_number: int) -> int:
-    """
-    Normalize an epoch-based segment number to a smaller, relative number.
-    This helps with large epoch-based segment numbers.
-    """
+    """Normalize an epoch-based segment number to a relative number."""
     global first_segment_timestamp
     
     if first_segment_timestamp is None:
         first_segment_timestamp = segment_number
-        print(f"First segment timestamp set to: {first_segment_timestamp}")
+        logger.info(f"First segment timestamp set to: {first_segment_timestamp}")
     
-    # Return segment number relative to the first segment we've seen
     return segment_number - first_segment_timestamp
 
 def get_segment_timestamp(segment_number: int) -> float:
-    """
-    Convert a segment number to a timestamp (in seconds) relative to stream start.
-    This is crucial for mapping segments to transcription times.
-    """
+    """Convert a segment number to a timestamp (in seconds) relative to stream start."""
     normalized_segment = normalize_segment_number(segment_number)
     return normalized_segment * SEGMENT_DURATION
 
+def cleanup_old_directories():
+    """Clean up old output directories to start fresh."""
+    try:
+        import shutil
+        for dir_path in [VIDEO_DIR, AUDIO_DIR, SUBTITLE_BASE_DIR]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+                logger.info(f"Cleaned up directory: {dir_path}")
+    except Exception as e:
+        logger.error(f"Error cleaning up directories: {e}")
+
+def ensure_directories_exist():
+    """Ensure all required directories exist."""
+    for dir_path in [VIDEO_DIR, AUDIO_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
+    
+    # Create subtitle directories for each language
+    for lang in caption_cues.keys():
+        os.makedirs(os.path.join(SUBTITLE_BASE_DIR, lang), exist_ok=True)
+
+# === Transcription Processing ===
+async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
+    """
+    Stream audio directly from the source HLS to Gladia for real-time transcription.
+    This approach avoids the circular dependency by not using the processed segments.
+    """
+    global ffmpeg_processes
+    
+    # FFmpeg command to extract audio directly from source and output PCM
+    ffmpeg_command = [
+        "ffmpeg", "-re",
+        "-i", STREAM_URL,  # Use original stream as source
+        "-ar", str(STREAMING_CONFIGURATION["sample_rate"]),
+        "-ac", str(STREAMING_CONFIGURATION["channels"]),
+        "-acodec", "pcm_s16le",
+        "-f", "wav",
+        "-bufsize", "16K",
+        "pipe:1",
+    ]
+    
+    logger.info(f"Starting audio extraction for Gladia: {' '.join(ffmpeg_command)}")
+    
+    process = subprocess.Popen(
+        ffmpeg_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=10**6,
+    )
+    
+    ffmpeg_processes["gladia_audio"] = process
+    logger.info("Started FFmpeg process for direct audio streaming to Gladia")
+    
+    # Calculate the chunk size based on configuration (100ms chunks)
+    chunk_size = int(
+        STREAMING_CONFIGURATION["sample_rate"]
+        * (STREAMING_CONFIGURATION["bit_depth"] / 8)
+        * STREAMING_CONFIGURATION["channels"]
+        * 0.1
+    )
+    
+    try:
+        # Skip WAV header (44 bytes) to avoid confusion
+        header = process.stdout.read(44)
+        
+        while True:
+            audio_chunk = process.stdout.read(chunk_size)
+            if not audio_chunk:
+                stderr = process.stderr.read()
+                if stderr:
+                    logger.error(f"FFmpeg audio streaming error: {stderr.decode()}")
+                break
+            
+            try:
+                await websocket.send(audio_chunk)
+                await asyncio.sleep(0.1)  # Control flow rate
+            except ConnectionClosedOK:
+                logger.info("Gladia WebSocket connection closed")
+                break
+            except Exception as e:
+                logger.error(f"Error sending audio to Gladia: {e}")
+                break
+        
+        logger.info("Finished sending audio data to Gladia")
+    
+    except Exception as e:
+        logger.error(f"Error in audio streaming: {e}")
+    finally:
+        try:
+            await stop_recording(websocket)
+        except Exception as e:
+            logger.error(f"Error stopping recording: {e}")
+        
+        if process and process.poll() is None:
+            process.terminate()
+            logger.info("Terminated audio extraction process")
+
+async def process_transcription_messages(websocket: WebSocketClientProtocol) -> None:
+    """
+    Process transcription and translation messages from Gladia.
+    Store transcriptions and prepare for synchronization with video segments.
+    """
+    global transcription_start_time, segment_time_offset, initialization_complete
+    
+    logger.info("Starting to process transcription messages from Gladia")
+    
+    # Function to normalize and synchronize timestamps
+    def normalize_timestamp(ts):
+        """Convert Gladia timestamp to stream-relative timestamp."""
+        if transcription_start_time is None:
+            return float(ts)  # Cannot normalize yet
+            
+        # Base normalization - relative to first transcript
+        normalized = float(ts) - transcription_start_time
+        
+        # Apply segment offset if available
+        if segment_time_offset is not None:
+            normalized += segment_time_offset
+            
+        return normalized
+    
+    async for message in websocket:
+        try:
+            content = json.loads(message)
+            msg_type = content["type"]
+            
+            # Handle original Russian transcriptions
+            if msg_type == "transcript" and content["data"]["is_final"]:
+                utterance = content["data"]["utterance"]
+                start = utterance["start"]
+                end = utterance["end"]
+                text = utterance["text"].strip()
+                
+                # Initialize timing reference on first transcript
+                if transcription_start_time is None:
+                    transcription_start_time = float(start)
+                    logger.info(f"Initialized transcription_start_time to {transcription_start_time}")
+                    
+                    # We need to synchronize with segment timestamps once they're available
+                    if first_segment_timestamp is not None:
+                        # Simple offset to align transcription with segments
+                        segment_time_offset = 0  # Start with no offset
+                        logger.info(f"Timing references initialized - first transcript at {start}s, first segment at {first_segment_timestamp}")
+                
+                # Normalize timestamps to stream timeline
+                stream_relative_start = normalize_timestamp(start)
+                stream_relative_end = normalize_timestamp(end)
+                
+                # Always log transcription data for debugging
+                logger.info(f"[RU] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                
+                # Store the cue with normalized stream timestamps
+                await store_caption_cue("ru", stream_relative_start, stream_relative_end, text)
+                
+                # Assess transcription buffer status against initialization threshold
+                if not initialization_complete and len(caption_cues["ru"]) >= TRANSCRIPTION_BUFFER_MIN:
+                    initialization_complete = True
+                    logger.info(f"Transcription buffer threshold achieved: {len(caption_cues['ru'])} cues accumulated")
+            
+            # Handle translations (English and Dutch)
+            elif msg_type == "translation":
+                try:
+                    # Format 1: Complete structure with translated_utterance
+                    if "utterance" in content["data"] and "translated_utterance" in content["data"]:
+                        utterance = content["data"]["utterance"]
+                        start = utterance["start"]
+                        end = utterance["end"]
+                        
+                        translated_utterance = content["data"]["translated_utterance"]
+                        text = translated_utterance["text"].strip()
+                        lang = content["data"]["target_language"]
+                        
+                        # Normalize timestamps
+                        stream_relative_start = normalize_timestamp(start)
+                        stream_relative_end = normalize_timestamp(end)
+                        
+                        if lang in ["en", "nl"] and text:
+                            logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                            await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
+                    
+                    # Format 2: Alternative structure (backup compatibility)
+                    elif "translation" in content["data"]:
+                        translation = content["data"]["translation"]
+                        
+                        # Get timestamps from either nested or outer level
+                        if "start" in translation and "end" in translation:
+                            start = translation["start"]
+                            end = translation["end"]
+                        else:
+                            start = content["data"]["start"]
+                            end = content["data"]["end"]
+                        
+                        # Normalize timestamps
+                        stream_relative_start = normalize_timestamp(start)
+                        stream_relative_end = normalize_timestamp(end)
+                        
+                        text = translation["text"].strip()
+                        lang = translation["target_language"]
+                        
+                        if lang in ["en", "nl"] and text:
+                            logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                            await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
+                
+                except Exception as e:
+                    logger.error(f"Error processing translation: {e}")
+                    logger.error(f"Translation message content: {json.dumps(content, indent=2)}")
+            
+            # Debug end-of-session message
+            elif msg_type == "post_final_transcript":
+                logger.info("\n#### End of session ####\n")
+                logger.info(json.dumps(content, indent=2, ensure_ascii=False))
+        
+        except json.JSONDecodeError:
+            logger.error("Failed to decode message from Gladia")
+        except Exception as e:
+            logger.error(f"Error processing message from Gladia: {e}")
+
+async def store_caption_cue(language, start_time, end_time, text):
+    """Store a caption cue in memory and update corresponding VTT files if needed."""
+    try:
+        # Ensure valid timestamps
+        start_time = float(start_time)
+        end_time = float(end_time)
+        
+        if end_time <= start_time:
+            logger.warning(f"Invalid timestamps: {start_time} -> {end_time}, adjusting end time")
+            end_time = start_time + 1.0  # Ensure at least 1 second duration
+        
+        # Add to in-memory caption store
+        caption_cues[language].append({
+            "start": start_time,
+            "end": end_time,
+            "text": text
+        })
+        
+        # Log caption storage for debugging
+        logger.info(f"Stored {language} caption: {format_duration(start_time)} -> {format_duration(end_time)}: {text[:30]}...")
+        logger.info(f"Total {language} captions in memory: {len(caption_cues[language])}")
+        
+        # For any existing segments that might contain this caption, update their VTT files
+        if first_segment_timestamp is not None:
+            await update_overlapping_vtt_segments(language, start_time, end_time)
+        else:
+            logger.warning("Cannot update VTT segments: first_segment_timestamp not initialized")
+    except Exception as e:
+        logger.error(f"Error storing caption cue: {e}")
+
+async def update_overlapping_vtt_segments(language, start_time, end_time):
+    """Update any VTT segments that would contain this caption timespan."""
+    try:
+        # Get current video segments from playlist
+        video_playlist_path = os.path.join(VIDEO_DIR, "playlist.m3u8")
+        if not os.path.exists(video_playlist_path):
+            logger.warning(f"Video playlist not found, cannot update VTT segments")
+            return
+        
+        current_segments = []
+        async with aiofiles.open(video_playlist_path, 'r') as f:
+            content = await f.read()
+            for line in content.splitlines():
+                if line.strip().endswith(".ts"):
+                    seg_num = int(line.strip().replace("segment", "").replace(".ts", ""))
+                    current_segments.append(seg_num)
+        
+        if not current_segments:
+            logger.warning(f"No segments found in playlist, cannot update VTT segments")
+            return
+            
+        logger.info(f"Found {len(current_segments)} current segments: {current_segments}")
+        logger.info(f"Checking for segments overlapping with caption: {format_duration(start_time)} -> {format_duration(end_time)}")
+        
+        # For each segment, check if it overlaps with the caption timespan
+        segments_updated = []
+        for seg_num in current_segments:
+            segment_start = (seg_num - first_segment_timestamp) * SEGMENT_DURATION
+            segment_end = segment_start + SEGMENT_DURATION
+            
+            logger.info(f"Checking segment {seg_num}: {format_duration(segment_start)} -> {format_duration(segment_end)}")
+            
+            # Check for overlap with caption timespan (use more flexible matching)
+            if (start_time >= segment_start - 5 and start_time < segment_end + 5) or \
+               (end_time > segment_start - 5 and end_time <= segment_end + 5) or \
+               (start_time <= segment_start + 5 and end_time >= segment_end - 5):
+                
+                logger.info(f"Found overlap! Updating {language} segment {seg_num}")
+                # This segment needs to be updated
+                success = await create_vtt_segment(seg_num, language)
+                if success:
+                    segments_updated.append(seg_num)
+        
+        # If no segments were updated due to the flexible matching, update the latest segment as fallback
+        if not segments_updated and current_segments:
+            latest_segment = max(current_segments)
+            logger.info(f"No overlapping segments found, updating latest segment {latest_segment} as fallback")
+            await create_vtt_segment(latest_segment, language)
+            segments_updated.append(latest_segment)
+        
+        # Update the subtitle playlist after any changes
+        if segments_updated:
+            logger.info(f"Updated segments {segments_updated}, updating subtitle playlist")
+            await update_subtitle_playlist(language)
+        else:
+            logger.warning(f"No segments were updated for caption at {format_duration(start_time)}")
+    
+    except Exception as e:
+        logger.error(f"Error updating overlapping VTT segments: {e}")
+
+async def stop_recording(websocket: WebSocketClientProtocol) -> None:
+    """Send a stop recording signal to Gladia."""
+    logger.info("Ending the recording session...")
+    try:
+        await websocket.send(json.dumps({"type": "stop_recording"}))
+        await asyncio.sleep(0.5)  # Give it time to process
+    except Exception as e:
+        logger.error(f"Error sending stop recording signal: {e}")
+
+# === HLS and Subtitle Generation ===
+async def create_hls_stream():
+    """
+    Create the HLS stream with separate audio and video tracks.
+    This runs independently from the transcription process.
+    """
+    global ffmpeg_processes, stream_start_time
+    
+    # Set up directories
+    ensure_directories_exist()
+    
+    # Start HLS generation with FFmpeg
+    ffmpeg_command = [
+        "ffmpeg", "-y",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", STREAM_URL,
+        # Audio output
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-map", "0:a",
+        "-f", "hls",
+        "-hls_time", str(SEGMENT_DURATION),
+        "-hls_list_size", str(WINDOW_SIZE),
+        "-hls_flags", "delete_segments+independent_segments+program_date_time",
+        "-hls_segment_type", "mpegts",
+        "-hls_allow_cache", "0",
+        "-hls_start_number_source", "epoch",
+        "-hls_segment_filename", os.path.join(AUDIO_DIR, "segment%d.ts"),
+        os.path.join(AUDIO_DIR, "playlist.m3u8"),
+        # Video output
+        "-map", "0:v",
+        "-c:v", "copy",
+        "-f", "hls",
+        "-hls_time", str(SEGMENT_DURATION),
+        "-hls_list_size", str(WINDOW_SIZE),
+        "-hls_flags", "delete_segments+independent_segments+program_date_time",
+        "-hls_segment_type", "mpegts",
+        "-hls_allow_cache", "0",
+        "-hls_start_number_source", "epoch",
+        "-hls_segment_filename", os.path.join(VIDEO_DIR, "segment%d.ts"),
+        os.path.join(VIDEO_DIR, "playlist.m3u8")
+    ]
+
+    logger.info("Starting FFmpeg for HLS stream generation")
+    logger.info(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
+    
+    try:
+        # Start FFmpeg process with real-time error output
+        process = subprocess.Popen(
+            ffmpeg_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1  # Line buffered
+        )
+        
+        ffmpeg_processes["hls_generator"] = process
+        stream_start_time = time.time()
+        
+        # Create initial master playlist
+        await create_master_playlist()
+        
+        # Monitor FFmpeg output in real-time
+        while True:
+            line = process.stderr.readline()
+            if not line and process.poll() is not None:
+                logger.error("FFmpeg process ended unexpectedly")
+                raise RuntimeError("FFmpeg process failed")
+            if line:
+                if DEBUG_MESSAGES:
+                    logger.info(f"FFmpeg: {line.strip()}")
+            
+            # Check if FFmpeg process has failed
+            if process.poll() is not None:
+                stderr = process.stderr.read()
+                logger.error(f"FFmpeg process failed: {stderr}")
+                break
+            
+            await asyncio.sleep(0.1)
+    
+    except Exception as e:
+        logger.error(f"Error in HLS stream generation: {e}")
+        raise
+    
+    finally:
+        # Cleanup processes
+        if process and process.poll() is None:
+            process.terminate()
+            logger.info("Terminated HLS generation process")
+
+async def create_master_playlist():
+    """Create the master playlist with subtitle tracks."""
+    master_playlist_path = os.path.join(HLS_OUTPUT_DIR, "master.m3u8")
+    
+    # Create subtitle directories
+    for lang in caption_cues.keys():
+        subtitle_dir = os.path.join(SUBTITLE_BASE_DIR, lang)
+        os.makedirs(subtitle_dir, exist_ok=True)
+    
+    # Build the master playlist content
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n\n"
+    content += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n'
+    
+    # Add subtitle tracks
+    lang_names = {"ru": "Russian", "en": "English", "nl": "Dutch"}
+    for lang, name in lang_names.items():
+        default = "YES" if lang == "ru" else "NO"
+        content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8"\n'
+    
+    # Add stream info with subtitles
+    content += '\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio",SUBTITLES="subs"\n'
+    content += 'video/playlist.m3u8\n'
+    
+    # Write master playlist
+    async with aiofiles.open(master_playlist_path, "w") as f:
+        await f.write(content)
+    
+    logger.info("Created master playlist with subtitle tracks")
+
 async def create_vtt_segment(segment_number, language="ru"):
-    """
-    Create a WebVTT segment file for the given segment number and language.
-    Each segment covers a specified duration of time based on segment number.
-    """
+    """Create a WebVTT segment file for the given segment number and language."""
     if first_segment_timestamp is None:
-        print(f"Cannot create VTT segment: first_segment_timestamp not initialized")
+        logger.warning(f"Cannot create VTT segment: first_segment_timestamp not initialized")
         return False
         
     try:
@@ -202,8 +625,8 @@ async def create_vtt_segment(segment_number, language="ru"):
         segment_start_time = (segment_number - first_segment_timestamp) * SEGMENT_DURATION
         segment_end_time = segment_start_time + SEGMENT_DURATION
         
-        print(f"\nCreating {language} VTT for segment {segment_number}")
-        print(f"Segment time window: {format_duration(segment_start_time)} -> {format_duration(segment_end_time)}")
+        logger.info(f"Creating {language} VTT for segment {segment_number}")
+        logger.info(f"Segment time window: {format_duration(segment_start_time)} -> {format_duration(segment_end_time)}")
         
         content = "WEBVTT\n\n"
         cue_index = 1
@@ -216,38 +639,39 @@ async def create_vtt_segment(segment_number, language="ru"):
                 
                 # Skip invalid cues
                 if cue_end <= cue_start:
+                    logger.warning(f"Skipping invalid cue: start={cue_start}, end={cue_end}")
                     continue
                 
-                # Check if cue overlaps with segment window (using absolute times)
-                if (cue_start >= segment_start_time and cue_start < segment_end_time) or \
-                   (cue_end > segment_start_time and cue_end <= segment_end_time) or \
-                   (cue_start <= segment_start_time and cue_end >= segment_end_time):
+                # Strict overlap check - the cue must actually overlap with this segment
+                if cue_start < segment_end_time and cue_end > segment_start_time:
+                    # Log the overlap check for debugging
+                    logger.info(f"Checking cue overlap: cue={cue_start}->{cue_end} segment={segment_start_time}->{segment_end_time}")
                     
-                    # Calculate cue timing relative to segment start
-                    relative_start = max(0, cue_start - segment_start_time)
-                    relative_end = min(SEGMENT_DURATION, cue_end - segment_start_time)
+                    # Calculate relative timing
+                    relative_start = cue_start - segment_start_time
+                    relative_end = cue_end - segment_start_time
                     
-                    print(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
-                    print(f"Text: {cue['text']}")
+                    logger.info(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
+                    logger.info(f"Text: {cue['text']}")
                     
                     content += f"{cue_index}\n"
                     content += f"{format_duration(relative_start)} --> {format_duration(relative_end)}\n"
                     content += f"{cue['text']}\n\n"
                     cue_index += 1
             except (ValueError, KeyError) as e:
-                print(f"Error processing cue: {e}")
+                logger.error(f"Error processing cue: {e}")
                 continue
         
-        # Write the segment file even if empty (required for HLS)
-        segment_path = os.path.join(HLS_OUTPUT_DIR, "subtitles", language, f"segment{segment_number}.vtt")
+        # Write the segment file
+        segment_path = os.path.join(SUBTITLE_BASE_DIR, language, f"segment{segment_number}.vtt")
         async with aiofiles.open(segment_path, "w", encoding="utf-8") as f:
             await f.write(content)
             
-        print(f"Created {language} segment {segment_number} with {cue_index-1} cues")
+        logger.info(f"Created {language} segment {segment_number} with {cue_index-1} cues")
         return True
         
     except Exception as e:
-        print(f"Error in create_vtt_segment: {str(e)}")
+        logger.error(f"Error in create_vtt_segment: {str(e)}")
         return False
 
 async def update_subtitle_playlist(language="ru"):
@@ -255,18 +679,19 @@ async def update_subtitle_playlist(language="ru"):
     Update the subtitle playlist for the given language.
     Ensures subtitle segments match video segments exactly.
     """
-    subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", language)
+    subtitle_dir = os.path.join(SUBTITLE_BASE_DIR, language)
     os.makedirs(subtitle_dir, exist_ok=True)
     playlist_path = os.path.join(subtitle_dir, "playlist.m3u8")
 
     # Get video playlist state - this is critical for synchronization
-    video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+    video_playlist = os.path.join(VIDEO_DIR, "playlist.m3u8")
     media_sequence = 0
     segments = []
     
     if os.path.exists(video_playlist):
-        with open(video_playlist, 'r') as f:
-            for line in f:
+        async with aiofiles.open(video_playlist, 'r') as f:
+            content = await f.read()
+            for line in content.splitlines():
                 if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
                     media_sequence = int(line.strip().split(":")[1])
                 elif line.strip().endswith(".ts"):
@@ -286,54 +711,36 @@ async def update_subtitle_playlist(language="ru"):
     async with aiofiles.open(playlist_path, "w", encoding="utf-8") as f:
         await f.write(content)
     
-    print(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
-
-async def create_master_playlist():
-    """
-    Create the master playlist with subtitle tracks.
-    """
-    master_playlist_path = os.path.join(HLS_OUTPUT_DIR, "master.m3u8")
-    
-    # Create subtitle directories
-    for lang in caption_cues.keys():
-        subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang)
-        os.makedirs(subtitle_dir, exist_ok=True)
-    
-    content = "#EXTM3U\n#EXT-X-VERSION:3\n\n"
-    content += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n'
-    
-    # Add subtitle tracks
-    lang_names = {"ru": "Russian", "en": "English", "nl": "Dutch"}
-    for lang, name in lang_names.items():
-        default = "YES" if lang == "ru" else "NO"
-        content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8"\n'
-    
-    # Add stream info with subtitles
-    content += '\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio",SUBTITLES="subs"\n'
-    content += 'video/playlist.m3u8\n'
-    
-    # Write master playlist
-    async with aiofiles.open(master_playlist_path, "w") as f:
-        await f.write(content)
-    
-    print("Created master playlist with subtitle tracks")
+    if DEBUG_MESSAGES:
+        logger.info(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
 
 async def monitor_segments_and_create_vtt():
     """
     Monitor video segments and create corresponding VTT segments.
+    This ensures subtitle segments are created for every video segment.
     """
-    global first_segment_timestamp, segment_counter
+    global first_segment_timestamp, ready_to_serve, segment_time_offset
+    
     processed_segments = set()
+    retry_count = 0
+    max_retries = 10
     
     while True:
         try:
             # Get current video segments
-            video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
+            video_playlist = os.path.join(VIDEO_DIR, "playlist.m3u8")
             if not os.path.exists(video_playlist):
-                print("Video playlist not found, waiting...")
-                await asyncio.sleep(1)
-                continue
-                
+                if retry_count < max_retries:
+                    logger.info("Video playlist not found, waiting...")
+                    retry_count += 1
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    logger.error(f"Video playlist not found after {max_retries} attempts")
+                    return
+            
+            retry_count = 0  # Reset retry count when successful
+            
             current_segments = []
             async with aiofiles.open(video_playlist, 'r') as f:
                 content = await f.read()
@@ -342,169 +749,101 @@ async def monitor_segments_and_create_vtt():
                         seg_num = int(line.strip().replace("segment", "").replace(".ts", ""))
                         current_segments.append(seg_num)
             
+            # Proceed only when segment data is available for synchronization
             if not current_segments:
-                print("No segments found in playlist, waiting...")
+                logger.info("Waiting for initial segment creation to establish temporal reference frame...")
                 await asyncio.sleep(1)
                 continue
             
             # Initialize first_segment_timestamp if not set
             if first_segment_timestamp is None and current_segments:
                 first_segment_timestamp = min(current_segments)
-                print(f"Initialized first_segment_timestamp to {first_segment_timestamp}")
+                logger.info(f"Initialized first_segment_timestamp to {first_segment_timestamp}")
                 
-            print(f"Current segments: {current_segments}")
-            print(f"Processed segments: {processed_segments}")
-            print(f"First segment timestamp: {first_segment_timestamp}")
+                # Important: Synchronize timing references
+                if transcription_start_time is not None:
+                    # Initialize with a simpler approach - just using normalized timestamps
+                    segment_time_offset = 0
+                    logger.info(f"Initialized segment_time_offset to 0 for simplified timestamp normalization")
+                    logger.info(f"Transcription start time: {transcription_start_time}, First segment: {first_segment_timestamp}")
             
-            # Process new segments
+            logger.info(f"Current segments: {current_segments}")
+            logger.info(f"Processed segments: {processed_segments}")
+            
+            # Force recreation of all subtitle segments periodically to ensure they have the latest captions
+            force_update_all = len(processed_segments) % 10 == 0
+            if force_update_all:
+                logger.info("Periodic full update of all subtitle segments")
+            
+            # Process new or updated segments
             for seg_num in current_segments:
-                if seg_num not in processed_segments:
-                    print(f"Processing new segment: {seg_num}")
+                if seg_num not in processed_segments or force_update_all:
+                    if seg_num not in processed_segments:
+                        logger.info(f"Processing new segment: {seg_num}")
+                    else:
+                        logger.info(f"Refreshing segment: {seg_num}")
                     
                     # Create VTT segments for all languages
+                    all_successful = True
                     for lang in caption_cues.keys():
                         success = await create_vtt_segment(seg_num, lang)
                         if success:
                             await update_subtitle_playlist(lang)
+                        else:
+                            all_successful = False
                     
-                    processed_segments.add(seg_num)
+                    if seg_num not in processed_segments:
+                        processed_segments.add(seg_num)
+                    
+                    # Validate buffer initialization criteria prior to service commencement
+                    if not ready_to_serve and len(processed_segments) >= REQUIRED_BUFFER_SEGMENTS:
+                        if initialization_complete and all_successful:  # Verify transcription data availability
+                            ready_to_serve = True
+                            logger.info(f"Buffer initialization complete: {len(processed_segments)} segments with synchronized transcriptions")
             
             # Clean up old segments
-            min_segment = min(current_segments)
-            processed_segments = {s for s in processed_segments if s >= min_segment}
+            if current_segments:
+                min_segment = min(current_segments)
+                processed_segments = {s for s in processed_segments if s >= min_segment}
             
             await asyncio.sleep(1)  # Check every second
             
         except Exception as e:
-            print(f"Error in segment monitoring: {str(e)}")
+            logger.error(f"Error in segment monitoring: {str(e)}")
             await asyncio.sleep(1)
-
-async def append_vtt_cue(language, start_time, end_time, text):
-    """
-    Append a new cue to the caption_cues list for the specified language.
-    Updated to handle epoch-based timing and correctly map to video segments.
-    """
-    try:
-        # Ensure we have proper number types
-        start_time = float(start_time)
-        end_time = float(end_time)
-        
-        # Ensure we have valid timestamps
-        if end_time <= start_time:
-            print(f"Invalid timestamps: {start_time} -> {end_time}, skipping")
-            return
-            
-        # Add to in-memory caption store
-        caption_cues[language].append({
-            "start": start_time,
-            "end": end_time,
-            "text": text
-        })
-        
-        print(f"[{language}] Added cue: {format_duration(start_time)} --> {format_duration(end_time)}")
-        print(f"Text: {text}")
-        print(f"Total cues for {language}: {len(caption_cues[language])}")
-        
-        # Find the video segment that would contain this caption
-        if first_segment_timestamp is not None:
-            # Get current video segment info
-            video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-            current_segments = []
-            
-            if os.path.exists(video_playlist):
-                with open(video_playlist, 'r') as f:
-                    for line in f:
-                        if line.strip().endswith(".ts"):
-                            seg_num = int(line.strip().replace("segment", "").replace(".ts", ""))
-                            current_segments.append(seg_num)
-            
-            # If we have segments, update VTT files for ones that overlap with this caption
-            if current_segments:
-                for seg_num in current_segments:
-                    # Calculate segment time relative to stream start
-                    segment_time = (seg_num - first_segment_timestamp) * SEGMENT_DURATION
-                    segment_end = segment_time + SEGMENT_DURATION
-                    
-                    # If caption overlaps with this segment's time window, update it
-                    if (start_time >= segment_time and start_time < segment_end) or \
-                       (end_time > segment_time and end_time <= segment_end) or \
-                       (start_time <= segment_time and end_time >= segment_end):
-                        print(f"Caption overlaps with segment {seg_num}")
-                        print(f"Segment window: {format_duration(segment_time)} -> {format_duration(segment_end)}")
-                        
-                        # Create VTT content
-                        content = "WEBVTT\n\n"
-                        cue_index = 1
-                        
-                        # Find all cues that overlap with this segment
-                        for cue in caption_cues[language]:
-                            cue_start = float(cue["start"])
-                            cue_end = float(cue["end"])
-                            
-                            # Skip invalid cues
-                            if cue_end <= cue_start:
-                                continue
-                            
-                            # Check if cue overlaps with segment window
-                            if (cue_start >= segment_time and cue_start < segment_end) or \
-                               (cue_end > segment_time and cue_end <= segment_end) or \
-                               (cue_start <= segment_time and cue_end >= segment_end):
-                                
-                                # Calculate cue timing relative to segment start
-                                relative_start = max(0, cue_start - segment_time)
-                                relative_end = min(SEGMENT_DURATION, cue_end - segment_time)
-                                
-                                print(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
-                                print(f"Text: {cue['text']}")
-                                
-                                content += f"{cue_index}\n"
-                                content += f"{format_duration(relative_start)} --> {format_duration(relative_end)}\n"
-                                content += f"{cue['text']}\n\n"
-                                cue_index += 1
-                        
-                        # Write the VTT file
-                        subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", language)
-                        os.makedirs(subtitle_dir, exist_ok=True)
-                        segment_path = os.path.join(subtitle_dir, f"segment{seg_num}.vtt")
-                        
-                        with open(segment_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        
-                        print(f"Created {language} segment {seg_num} with {cue_index-1} cues")
-                
-                # Always update playlist after adding captions
-                await update_subtitle_playlist(language)
-        
-    except Exception as e:
-        print(f"Error in append_vtt_cue: {str(e)}")
-        print(f"Failed to append cue: {start_time} -> {end_time}: {text}")
 
 # === FastAPI Server ===
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    """Serve the index.html page."""
-    content = await generate_index_html()
-    return HTMLResponse(
-        content=content,
-        status_code=200,
-        headers={
-            "Content-Type": "text/html",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-    )
+    """Serve a minimal page that auto-redirects to the player."""
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="0;URL='/player.html'" />
+    </head>
+    <body>
+        <p>Redirecting to player...</p>
+    </body>
+    </html>
+    """)
 
-@app.get("/index.html")
-async def index():
-    """Serve the index.html page."""
-    return await root()
+@app.get("/player.html")
+async def player_page():
+    """Serve the video player page."""
+    return HTMLResponse(await generate_player_html())
 
 @app.get("/master.m3u8")
 async def master_playlist():
-    """Serve the master playlist with subtitle tracks."""
+    """Serve the master playlist. Returns 404 until buffer initialization is complete."""
+    global ready_to_serve
+    
+    # Restrict content delivery until buffer initialization criteria are satisfied
+    if not ready_to_serve:
+        return PlainTextResponse(content="Media buffer initialization in progress", status_code=404)
+    
     file_path = os.path.join(HLS_OUTPUT_DIR, "master.m3u8")
     if not os.path.exists(file_path):
         return PlainTextResponse(content="Playlist not found", status_code=404)
@@ -521,63 +860,15 @@ async def master_playlist():
         }
     )
 
-@app.get("/subtitles/{lang}/playlist.m3u8")
-async def subtitle_playlist(lang: str):
-    """Serve the subtitle playlist for a specific language."""
-    if lang not in caption_cues:
-        return PlainTextResponse(content="Language not found", status_code=404)
-    
-    playlist_path = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang, "playlist.m3u8")
-    if not os.path.exists(playlist_path):
-        # Create empty playlist if it doesn't exist yet
-        subtitle_dir = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang)
-        os.makedirs(subtitle_dir, exist_ok=True)
-        
-        content = "#EXTM3U\n"
-        content += "#EXT-X-VERSION:3\n"
-        content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
-        content += "#EXT-X-MEDIA-SEQUENCE:0\n"
-        
-        async with aiofiles.open(playlist_path, "w") as f:
-            await f.write(content)
-    
-    return FileResponse(
-        path=playlist_path,
-        media_type="application/vnd.apple.mpegurl",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Origin, Content-Type, Accept"
-        }
-    )
-
-@app.get("/subtitles/{lang}/segment{segment_num}.vtt")
-async def subtitle_segment(lang: str, segment_num: int):
-    """Serve a specific subtitle segment."""
-    if lang not in caption_cues:
-        return PlainTextResponse(content="Language not found", status_code=404)
-    
-    segment_path = os.path.join(HLS_OUTPUT_DIR, "subtitles", lang, f"segment{segment_num}.vtt")
-    if not os.path.exists(segment_path):
-        # Create an empty segment if it doesn't exist
-        await create_vtt_segment(segment_num, lang)
-    
-    return FileResponse(
-        path=segment_path,
-        media_type="text/vtt",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
-    )
-
 @app.get("/{file_path:path}")
 async def serve_file(file_path: str):
-    """Serve files from the output directory."""
+    """Serve files from the output directory according to buffer initialization status."""
+    global ready_to_serve
+    
+    # Restrict access to primary playlists until buffer initialization is complete
+    if file_path in ["video/playlist.m3u8", "audio/playlist.m3u8"] and not ready_to_serve:
+        return PlainTextResponse(content="Media buffer initialization in progress", status_code=404)
+    
     full_path = os.path.join(HLS_OUTPUT_DIR, file_path)
     if not os.path.exists(full_path):
         return PlainTextResponse(content="File not found", status_code=404)
@@ -588,14 +879,10 @@ async def serve_file(file_path: str):
         content_type = "application/vnd.apple.mpegurl"
     elif file_path.endswith(".ts"):
         content_type = "video/mp2t"
-    elif file_path.endswith(".m4s"):
-        content_type = "video/iso.segment"
-    elif file_path.endswith(".mp4"):
-        content_type = "video/mp4"
     elif file_path.endswith(".vtt"):
         content_type = "text/vtt"
     
-    # Add CORS and cache control headers for all HLS-related files
+    # Add CORS and cache control headers
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -622,88 +909,8 @@ async def options_handler(file_path: str):
         }
     )
 
-@app.get("/video/playlist.m3u8")
-async def video_playlist():
-    """Serve the video playlist."""
-    playlist_path = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-    if not os.path.exists(playlist_path):
-        return PlainTextResponse(content="Video playlist not found", status_code=404)
-    
-    return FileResponse(
-        path=playlist_path,
-        media_type="application/vnd.apple.mpegurl",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Origin, Content-Type, Accept"
-        }
-    )
-
-@app.get("/audio/playlist.m3u8")
-async def audio_playlist():
-    """Serve the audio playlist."""
-    playlist_path = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
-    if not os.path.exists(playlist_path):
-        return PlainTextResponse(content="Audio playlist not found", status_code=404)
-    
-    return FileResponse(
-        path=playlist_path,
-        media_type="application/vnd.apple.mpegurl",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Origin, Content-Type, Accept"
-        }
-    )
-
-@app.get("/video/segment{segment_num}.ts")
-async def video_segment(segment_num: int):
-    """Serve a video segment."""
-    segment_path = os.path.join(HLS_OUTPUT_DIR, "video", f"segment{segment_num}.ts")
-    if not os.path.exists(segment_path):
-        return PlainTextResponse(content="Video segment not found", status_code=404)
-    
-    return FileResponse(
-        path=segment_path,
-        media_type="video/mp2t",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Origin, Content-Type, Accept"
-        }
-    )
-
-@app.get("/audio/segment{segment_num}.ts")
-async def audio_segment(segment_num: int):
-    """Serve an audio segment."""
-    segment_path = os.path.join(HLS_OUTPUT_DIR, "audio", f"segment{segment_num}.ts")
-    if not os.path.exists(segment_path):
-        return PlainTextResponse(content="Audio segment not found", status_code=404)
-    
-    return FileResponse(
-        path=segment_path,
-        media_type="video/mp2t",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Origin, Content-Type, Accept"
-        }
-    )
-
-async def generate_index_html():
-    """Generate an index.html file with an HLS player supporting native captions."""
+async def generate_player_html():
+    """Generate a minimal HTML player supporting HLS with captions."""
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -711,75 +918,56 @@ async def generate_index_html():
     <title>TV Rain Live Stream</title>
     <style>
         body {
-            font-family: Arial, sans-serif;
-            padding: 20px;
-            background: #f4f4f4;
-            color: #333;
             margin: 0;
+            padding: 0;
+            background: #000;
+            color: #fff;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
         }
         .player-container {
-            max-width: 960px;
-            margin: 0 auto;
-            background: #fff;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #2c3e50;
-            text-align: center;
-            margin-bottom: 20px;
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
         }
         video {
             width: 100%;
-            height: auto;
-            border-radius: 4px;
+            height: 100%;
+            object-fit: contain;
         }
         .controls {
-            margin-top: 15px;
+            position: absolute;
+            bottom: 60px;
+            left: 0;
+            width: 100%;
             display: flex;
             justify-content: center;
             gap: 10px;
-            flex-wrap: wrap;
+            z-index: 10;
         }
         button {
             padding: 8px 15px;
-            background: #3498db;
+            background: rgba(0,0,0,0.7);
             color: white;
-            border: none;
+            border: 1px solid rgba(255,255,255,0.3);
             border-radius: 4px;
             cursor: pointer;
             font-size: 14px;
         }
         button:hover {
-            background: #2980b9;
+            background: rgba(0,0,0,0.9);
+            border-color: rgba(255,255,255,0.5);
         }
         button.active {
-            background: #27ae60;
-        }
-        .debug-panel {
-            margin-top: 15px;
-            padding: 10px;
-            background: #f9f9f9;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 13px;
-            max-height: 150px;
-            overflow-y: auto;
-        }
-        .status {
-            margin-top: 15px;
-            padding: 8px;
-            border-radius: 4px;
-            background: #f8f9fa;
-            text-align: center;
-            font-size: 14px;
+            background: rgba(40,120,200,0.7);
+            border-color: rgba(255,255,255,0.7);
         }
     </style>
 </head>
 <body>
     <div class="player-container">
-        <h1>TV Rain Live Stream</h1>
         <video id="video" controls autoplay></video>
         
         <div class="controls">
@@ -787,47 +975,24 @@ async def generate_index_html():
             <button onclick="player.selectTextTrack('en')" id="btn-en">English</button>
             <button onclick="player.selectTextTrack('nl')" id="btn-nl">Dutch</button>
             <button onclick="player.disableTextTrack()" id="btn-none">No Subtitles</button>
-            <button onclick="player.reloadPlayer()" id="btn-reload">Reload Player</button>
         </div>
-        
-        <div class="status" id="status">Loading stream...</div>
-        
-        <div class="debug-panel" id="debug-panel"></div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12"></script>
     <script>
-        const debugPanel = document.getElementById('debug-panel');
-        function log(message) {
-            console.log(message);
-            const time = new Date().toTimeString().split(' ')[0];
-            debugPanel.innerHTML += `[${time}] ${message}<br>`;
-            debugPanel.scrollTop = debugPanel.scrollHeight;
-        }
-        
         const player = {
             hlsInstance: null,
             videoElement: document.getElementById('video'),
-            statusElement: document.getElementById('status'),
             
             init() {
                 if (!Hls.isSupported()) {
-                    this.statusElement.textContent = 'HLS.js is not supported in this browser';
+                    console.error('HLS.js is not supported in this browser');
                     return;
                 }
                 
                 this.hlsInstance = new Hls({
-                    debug: true,
+                    debug: false,
                     enableWebVTT: true,
-                    manifestLoadingTimeOut: 20000,
-                    manifestLoadingMaxRetry: 3,
-                    manifestLoadingRetryDelay: 500,
-                    levelLoadingTimeOut: 20000,
-                    levelLoadingMaxRetry: 3,
-                    levelLoadingRetryDelay: 500,
-                    fragLoadingTimeOut: 20000,
-                    fragLoadingMaxRetry: 3,
-                    fragLoadingRetryDelay: 500,
                     startLevel: -1,
                     defaultAudioCodec: 'mp4a.40.2',
                     maxBufferLength: 30,
@@ -846,7 +1011,7 @@ async def generate_index_html():
             
             loadStream() {
                 const manifestUrl = 'master.m3u8';
-                log(`Loading manifest: ${manifestUrl}`);
+                console.log(`Loading manifest: ${manifestUrl}`);
                 
                 this.hlsInstance.loadSource(manifestUrl);
                 this.hlsInstance.attachMedia(this.videoElement);
@@ -854,22 +1019,20 @@ async def generate_index_html():
             
             setupEventListeners() {
                 this.hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-                    log('Manifest parsed, attempting playback...');
+                    console.log('Manifest parsed, attempting playback...');
                     this.videoElement.play()
                         .then(() => {
-                            this.statusElement.textContent = 'Playing stream';
-                            log('Playback started');
+                            console.log('Playback started');
                             this.selectTextTrack('ru');
                         })
                         .catch(error => {
-                            log(`Playback failed: ${error.message}`);
-                            this.statusElement.textContent = 'Click play to start';
+                            console.error(`Playback failed: ${error.message}`);
                         });
                 });
                 
                 this.hlsInstance.on(Hls.Events.ERROR, (event, data) => {
                     if (data.fatal) {
-                        log(`Fatal error: ${data.type} - ${data.details}`);
+                        console.error(`Fatal error: ${data.type} - ${data.details}`);
                         switch(data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
                                 this.hlsInstance.startLoad();
@@ -883,11 +1046,6 @@ async def generate_index_html():
                         }
                     }
                 });
-                
-                this.videoElement.addEventListener('error', (e) => {
-                    log(`Video error: ${e.message}`);
-                    this.statusElement.textContent = 'Video error - try reloading';
-                });
             },
             
             selectTextTrack(language) {
@@ -898,8 +1056,7 @@ async def generate_index_html():
                 
                 if (trackId !== -1) {
                     this.hlsInstance.subtitleTrack = trackId;
-                    log(`Selected ${language} subtitles`);
-                    this.statusElement.textContent = `Playing with ${language.toUpperCase()} subtitles`;
+                    console.log(`Selected ${language} subtitles`);
                     
                     document.querySelectorAll('.controls button').forEach(btn => {
                         btn.classList.remove('active');
@@ -911,8 +1068,7 @@ async def generate_index_html():
                 if (!this.hlsInstance) return;
                 
                 this.hlsInstance.subtitleTrack = -1;
-                log('Disabled subtitles');
-                this.statusElement.textContent = 'Playing without subtitles';
+                console.log('Disabled subtitles');
                 
                 document.querySelectorAll('.controls button').forEach(btn => {
                     btn.classList.remove('active');
@@ -921,7 +1077,7 @@ async def generate_index_html():
             },
             
             reloadPlayer() {
-                log('Reloading player...');
+                console.log('Reloading player...');
                 if (this.hlsInstance) {
                     this.hlsInstance.destroy();
                 }
@@ -938,370 +1094,79 @@ async def generate_index_html():
 </html>
 """
 
-# === Audio & Transcription Handling ===
-async def stream_audio_from_hls(socket: WebSocketClientProtocol, hls_url: str) -> None:
-    """
-    Launch FFmpeg to stream audio from the HLS URL to Gladia via WebSocket.
-    """
-    global ffmpeg_audio_process
-    
-    # Use the audio playlist instead of the master playlist
-    audio_playlist = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
-    
-    # Wait for the audio playlist to be created
-    while not os.path.exists(audio_playlist):
-        print("Waiting for audio playlist to be created...")
-        await asyncio.sleep(1)
-    
-    print(f"Audio playlist found at {audio_playlist}")
-    
-    ffmpeg_command = [
-        "ffmpeg", "-re",
-        "-i", audio_playlist,
-        "-ar", str(STREAMING_CONFIGURATION["sample_rate"]),
-        "-ac", str(STREAMING_CONFIGURATION["channels"]),
-        "-acodec", "pcm_s16le",  # Ensure we output raw PCM
-        "-f", "wav",
-        "-bufsize", "16K",
-        "pipe:1",
-    ]
-    
-    print(f"Starting audio streaming FFmpeg: {' '.join(ffmpeg_command)}")
-    
-    ffmpeg_audio_process = subprocess.Popen(
-        ffmpeg_command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=10**6,
-    )
-    
-    print("Started FFmpeg process for audio streaming to Gladia")
-    
-    chunk_size = int(
-        STREAMING_CONFIGURATION["sample_rate"]
-        * (STREAMING_CONFIGURATION["bit_depth"] / 8)
-        * STREAMING_CONFIGURATION["channels"]
-        * 0.1  # 100ms chunks
-    )
-    
-    while True:
-        audio_chunk = ffmpeg_audio_process.stdout.read(chunk_size)
-        if not audio_chunk:
-            stderr = ffmpeg_audio_process.stderr.read()
-            if stderr:
-                print(f"FFmpeg audio streaming error: {stderr.decode()}")
-            break
-        try:
-            await socket.send(audio_chunk)
-            await asyncio.sleep(0.1)
-        except ConnectionClosedOK:
-            print("Gladia WebSocket connection closed")
-            break
-    
-    print("Finished sending audio data")
-    try:
-        await stop_recording(socket)
-    except Exception as e:
-        print(f"Error stopping recording: {e}")
-    
-    if ffmpeg_audio_process:
-        ffmpeg_audio_process.terminate()
-
-async def process_messages_from_socket(socket: WebSocketClientProtocol) -> None:
-    """
-    Process transcription and translation messages from Gladia.
-    For each final transcript and translation, create corresponding VTT segments.
-    """
-    global transcription_start_time, segment_time_offset
-    
-    async for message in socket:
-        content = json.loads(message)
-        msg_type = content["type"]
-        
-        if msg_type == "transcript" and content["data"]["is_final"]:
-            utterance = content["data"]["utterance"]
-            start = utterance["start"]
-            end = utterance["end"]
-            text = utterance["text"].strip()
-            
-            # Initialize timing reference and sync with segments
-            if transcription_start_time is None:
-                transcription_start_time = float(start)
-                if first_segment_timestamp is not None:
-                    segment_time_offset = first_segment_timestamp * SEGMENT_DURATION
-                print(f"First transcript at {start}s, stream time reference initialized")
-                print(f"Segment time offset: {segment_time_offset}")
-            
-            # Convert timestamps to be relative to segment timeline
-            stream_relative_start = float(start) - transcription_start_time
-            if segment_time_offset is not None:
-                stream_relative_start += segment_time_offset
-            stream_relative_end = float(end) - transcription_start_time
-            if segment_time_offset is not None:
-                stream_relative_end += segment_time_offset
-            
-            print(f"[Original] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
-            await append_vtt_cue("ru", stream_relative_start, stream_relative_end, text)
-            
-        # Handle translations
-        elif msg_type == "translation":
-            try:
-                # Format 1: Complete structure with translated_utterance
-                if "utterance" in content["data"] and "translated_utterance" in content["data"]:
-                    # Get the original utterance for timing
-                    utterance = content["data"]["utterance"]
-                    start = utterance["start"]
-                    end = utterance["end"]
-                    
-                    # Get the translated text from translated_utterance
-                    translated_utterance = content["data"]["translated_utterance"]
-                    text = translated_utterance["text"].strip()
-                    lang = content["data"]["target_language"]
-                    
-                    # Calculate stream-relative timestamps
-                    stream_relative_start = float(start) - transcription_start_time
-                    stream_relative_end = float(end) - transcription_start_time
-                    
-                    if lang in ["en", "nl"]:
-                        print(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
-                        await append_vtt_cue(lang, stream_relative_start, stream_relative_end, text)
-                        
-                # Format 2: Other formats - kept for fallback compatibility
-                elif "translation" in content["data"]:
-                    translation = content["data"]["translation"]
-                    # Get timestamps from either nested or outer level
-                    if "start" in translation and "end" in translation:
-                        start = translation["start"]
-                        end = translation["end"]
-                    else:
-                        start = content["data"]["start"]
-                        end = content["data"]["end"]
-                    
-                    # Calculate stream-relative timestamps
-                    stream_relative_start = float(start) - transcription_start_time
-                    stream_relative_end = float(end) - transcription_start_time
-                    
-                    text = translation["text"].strip()
-                    lang = translation["target_language"]
-                    if lang in ["en", "nl"]:
-                        print(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
-                        await append_vtt_cue(lang, stream_relative_start, stream_relative_end, text)
-                
-                # Handle any other formats
-                else:
-                    print(f"Unknown translation format: {json.dumps(content, indent=2)}")
-            except Exception as e:
-                print(f"Error processing translation: {e}")
-                print(f"Message content was: {json.dumps(content, indent=2)}")
-        
-        if msg_type == "post_final_transcript":
-            print("\n################ End of session ################\n")
-            print(json.dumps(content, indent=2, ensure_ascii=False))
-
-async def stop_recording(websocket: WebSocketClientProtocol) -> None:
-    """Send a stop recording signal to Gladia."""
-    print(">>>>> Ending the recording...")
-    try:
-        await websocket.send(json.dumps({"type": "stop_recording"}))
-    except Exception as e:
-        print(f"Error sending stop recording signal: {e}")
-    await asyncio.sleep(0)
-    
-    # Clean up processes
-    if ffmpeg_audio_process:
-        ffmpeg_audio_process.terminate()
-
-# === FFmpeg HLS Output ===
-async def start_ffmpeg_hls():
-    """
-    Use FFmpeg to create a live HLS stream with separate audio and video tracks.
-    """
-    os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
-    
-    # Create output directories
-    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "audio"), exist_ok=True)
-    os.makedirs(os.path.join(HLS_OUTPUT_DIR, "video"), exist_ok=True)
-    
-    try:
-        ffmpeg_command = [
-            "ffmpeg", "-y",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-i", EXAMPLE_HLS_STREAM_URL,
-            # Audio output
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "44100",
-            "-map", "0:a",
-            "-f", "hls",
-            "-hls_time", str(SEGMENT_DURATION),
-            "-hls_list_size", str(WINDOW_SIZE),
-            "-hls_flags", "delete_segments+independent_segments+program_date_time",
-            "-hls_segment_type", "mpegts",
-            "-hls_allow_cache", "0",
-            "-hls_start_number_source", "epoch",
-            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "audio", "segment%d.ts"),
-            os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8"),
-            # Video output
-            "-map", "0:v",
-            "-c:v", "copy",
-            "-f", "hls",
-            "-hls_time", str(SEGMENT_DURATION),
-            "-hls_list_size", str(WINDOW_SIZE),
-            "-hls_flags", "delete_segments+independent_segments+program_date_time",
-            "-hls_segment_type", "mpegts",
-            "-hls_allow_cache", "0",
-            "-hls_start_number_source", "epoch",
-            "-hls_segment_filename", os.path.join(HLS_OUTPUT_DIR, "video", "segment%d.ts"),
-            os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-        ]
-
-        print("Starting FFmpeg for HLS stream...")
-        print(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
-        
-        # Start FFmpeg process with real-time error output
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1  # Line buffered
-        )
-        
-        # Create initial master playlist
-        await create_master_playlist()
-        
-        # Monitor FFmpeg output in real-time
-        async def monitor_ffmpeg():
-            while True:
-                line = ffmpeg_process.stderr.readline()
-                if not line and ffmpeg_process.poll() is not None:
-                    print("FFmpeg process ended unexpectedly")
-                    raise RuntimeError("FFmpeg process failed")
-                if line:
-                    print(f"FFmpeg: {line.strip()}")
-                await asyncio.sleep(0.1)
-        
-        # Start monitoring task
-        monitor_task = asyncio.create_task(monitor_ffmpeg())
-        
-        # Monitor the playlists
-        audio_playlist = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
-        video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-        timeout = 30  # 30 seconds timeout
-        start_time = time.time()
-        
-        while not (os.path.exists(audio_playlist) and os.path.exists(video_playlist)):
-            if time.time() - start_time > timeout:
-                raise TimeoutError("Failed to generate playlists within timeout")
-            
-            # Check if FFmpeg process has failed
-            if ffmpeg_process.poll() is not None:
-                stderr = ffmpeg_process.stderr.read()
-                raise RuntimeError(f"FFmpeg process failed: {stderr}")
-            
-            print("Waiting for playlists to be created...")
-            await asyncio.sleep(1)
-        
-        print("HLS stream is ready")
-        await monitor_task  # Keep monitoring FFmpeg output
-        
-    except Exception as e:
-        print(f"Error in start_ffmpeg_hls: {e}")
-        if 'ffmpeg_process' in locals():
-            stderr = ffmpeg_process.stderr.read()
-            print(f"FFmpeg error output: {stderr}")
-        raise
-    
-    finally:
-        # Cleanup processes
-        if 'ffmpeg_process' in locals():
-            ffmpeg_process.terminate()
-
-# === Main Transcription Flow ===
+# === Main Application Flow ===
 async def transcription_main():
     """
     Main function to coordinate the transcription and HLS generation process.
+    This implements the parallel processing approach where audio extraction for
+    transcription happens independently from HLS segment creation.
     """
-    print("\nStarting Rainscribe with native HLS subtitle integration")
+    global ffmpeg_processes, ready_to_serve
     
-    # Clear existing files and create directories (unchanged)
-    ...
+    logger.info("\n===== Starting Rainscribe with native HLS subtitle integration =====")
     
-    # Start FFmpeg WITHOUT the delay to begin collecting segments
-    packager_task = asyncio.create_task(start_ffmpeg_hls())
+    # Clear existing files and create directories
+    cleanup_old_directories()
+    ensure_directories_exist()
     
-    # Wait for initial segments to be created
-    audio_playlist = os.path.join(HLS_OUTPUT_DIR, "audio", "playlist.m3u8")
-    video_playlist = os.path.join(HLS_OUTPUT_DIR, "video", "playlist.m3u8")
-    
-    while not (os.path.exists(audio_playlist) and os.path.exists(video_playlist)):
-        print("Waiting for playlists to be created...")
-        await asyncio.sleep(1)
-    
-    # Initialize Gladia and start transcription
-    response = init_live_session(STREAMING_CONFIGURATION)
-    
-    async with ws_connect(response["url"]) as websocket:
-        print("\n################ Begin session ################\n")
+    try:
+        # Start FFmpeg for HLS generation (run in background)
+        hls_task = asyncio.create_task(create_hls_stream())
         
-        message_task = asyncio.create_task(process_messages_from_socket(websocket))
-        audio_task = asyncio.create_task(stream_audio_from_hls(websocket, EXAMPLE_HLS_STREAM_URL))
+        # Initialize Gladia transcription session
+        response = init_live_session(STREAMING_CONFIGURATION)
+        logger.info(f"Gladia session initialized: {response['id']}")
         
-        # Buffer initial segments and transcriptions
-        print(f"Buffering {SEGMENT_BUFFER_COUNT} segments ({INITIAL_BUFFER_SECONDS} seconds)...")
-        buffer_start = time.time()
-        
-        while True:
-            if not os.path.exists(video_playlist):
-                await asyncio.sleep(1)
-                continue
-                
-            async with aiofiles.open(video_playlist, 'r') as f:
-                content = await f.read()
-                segments = [line.strip() for line in content.splitlines() if line.strip().endswith(".ts")]
-                
-            if len(segments) >= SEGMENT_BUFFER_COUNT:
-                print(f"Collected {len(segments)} segments")
-                print(f"Collected {len(caption_cues['ru'])} Russian cues")
-                break
-                
-            if time.time() - buffer_start > INITIAL_BUFFER_SECONDS + 30:  # 30s extra grace period
-                print("Buffer timeout reached")
-                break
-                
-            print(f"Buffering: {len(segments)}/{SEGMENT_BUFFER_COUNT} segments, {len(caption_cues['ru'])} cues")
-            await asyncio.sleep(1)
-        
-        # Start serving content
-        print("Starting web server...")
-        web_server_task = asyncio.create_task(start_web_server())
-        segment_monitor_task = asyncio.create_task(monitor_segments_and_create_vtt())
-        
-        try:
-            await asyncio.gather(message_task, audio_task, web_server_task, packager_task, segment_monitor_task)
-        except asyncio.CancelledError:
-            print("Tasks cancelled - shutting down...")
-        finally:
-            if ffmpeg_audio_process:
-                ffmpeg_audio_process.terminate()
+        # Start transcription and VTT generation
+        async with ws_connect(response["url"]) as websocket:
+            logger.info("\n===== Transcription session started =====")
+            
+            # Start tasks in parallel
+            message_task = asyncio.create_task(process_transcription_messages(websocket))
+            audio_task = asyncio.create_task(stream_audio_to_gladia(websocket))
+            segment_monitor_task = asyncio.create_task(monitor_segments_and_create_vtt())
+            
+            # Start web server
+            logger.info("Starting web server...")
+            web_server_task = asyncio.create_task(start_web_server())
+            
+            # Wait for all tasks
+            await asyncio.gather(message_task, audio_task, web_server_task, hls_task, segment_monitor_task)
+            
+    except asyncio.CancelledError:
+        logger.info("Tasks cancelled - shutting down...")
+    except Exception as e:
+        logger.error(f"Error in main process: {e}")
+    finally:
+        # Cleanup all processes
+        for name, process in ffmpeg_processes.items():
+            if process and process.poll() is None:
+                process.terminate()
+                logger.info(f"Terminated {name} process")
 
 async def start_web_server():
     """Start the FastAPI web server."""
-    config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT)
+    config = uvicorn.Config(app, host="0.0.0.0", port=HTTP_PORT, log_level="error")
     server = uvicorn.Server(config)
     await server.serve()
 
-# Add new constants at the top with other configuration
-INITIAL_BUFFER_SECONDS = 60
-SEGMENT_BUFFER_COUNT = INITIAL_BUFFER_SECONDS // SEGMENT_DURATION
+# === Signal Handling ===
+def handle_exit(*args):
+    """Handle exit signals gracefully."""
+    logger.info("Received exit signal, cleaning up...")
+    for name, process in ffmpeg_processes.items():
+        if process and process.poll() is None:
+            process.terminate()
+            logger.info(f"Terminated {name} process")
+    sys.exit(0)
 
 if __name__ == "__main__":
+    # Register signal handlers
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+    
     try:
         asyncio.run(transcription_main())
     except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
-        if ffmpeg_audio_process:
-            ffmpeg_audio_process.terminate()
+        logger.info("\nShutting down gracefully...")
         sys.exit(0)
