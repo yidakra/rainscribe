@@ -1,18 +1,17 @@
 # Rainscribe
 
-Live transcription with embedded caption track for HLS streaming.
+Live transcription with native HLS subtitle integration for HLS streaming.
 
 ## Features
 
-- Initializes a live transcription session with Gladia API
-- Streams audio from an HLS URL (via FFmpeg) to Gladia's WebSocket endpoint
-- Receives transcription messages continuously and appends each final transcript as a WebVTT cue
-- Uses FFmpeg to create HLS output with separate audio and video streams
-- Generates a master playlist that includes the audio/video streams and external subtitles tracks
-- Serves the HLS stream, master playlist, segments, and live captions via a FastAPI server
-- Supports multiple languages (Russian + English and Dutch translations)
-- Real-time caption updates via WebSocket
-- Containerized with Docker for easy deployment
+- Real-time transcription and translation of live HLS streams using Gladia API
+- Native HLS subtitle integration (no WebSocket-based caption overlay)
+- Supports multiple languages simultaneously (Russian source + English and Dutch translations)
+- 60-second buffered playback for reliable caption synchronization
+- Separate audio, video, and subtitle tracks for optimal streaming
+- Clean player interface with native caption controls
+- Docker containerization for easy deployment
+- Configurable logging levels for different types of messages
 
 ## Prerequisites
 
@@ -27,102 +26,121 @@ Live transcription with embedded caption track for HLS streaming.
    cd rainscribe
    ```
 
-2. Create a `.env` file with your Gladia API key:
+2. Create a `.env` file with your configuration:
    ```bash
-   echo "GLADIA_API_KEY=your_api_key_here" > .env
+   GLADIA_API_KEY=your_api_key_here
+   STREAM_URL=https://your-hls-stream-url.m3u8  # Optional
+   
+   # Logging configuration (optional)
+   CAPTIONS_LOG_LEVEL=INFO    # Show caption text
+   SYSTEM_LOG_LEVEL=ERROR     # Hide system messages
+   TRANSCRIPTION_LOG_LEVEL=ERROR  # Hide transcription details
    ```
 
-3. Optionally, specify a custom HLS stream URL:
+3. Start the container:
    ```bash
-   echo "STREAM_URL=https://your-hls-stream-url.m3u8" >> .env
+   docker-compose up --build
    ```
 
-4. Start the container:
-   ```bash
-   docker-compose up
-   ```
-
-5. Open your browser and navigate to:
+4. Open your browser and navigate to:
    ```
    http://localhost:8080/
    ```
 
-## Manual Setup (without Docker)
-
-If you prefer to run without Docker:
-
-1. Install Python 3.11
-2. Install FFmpeg
-3. Install the required Python packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Run the script:
-   ```bash
-   python rainscribe.py YOUR_GLADIA_API_KEY
-   ```
-
 ## Configuration
 
-You can customize the behavior through environment variables:
+### Environment Variables
 
-- `GLADIA_API_KEY`: Your Gladia API key (required)
-- `STREAM_URL`: URL of the HLS stream to transcribe (default: https://wl.tvrain.tv/transcode/ses_1080p/playlist.m3u8)
+#### Required:
+- `GLADIA_API_KEY`: Your Gladia API key
+
+#### Optional:
+- `STREAM_URL`: URL of the HLS stream to transcribe (default: TV Rain stream)
 - `HTTP_PORT`: Port for the HTTP server (default: 8080)
-- `MIN_CUES`: Minimum number of captions to buffer before starting (default: 2)
+- `SEGMENT_DURATION`: Duration of each HLS segment in seconds (default: 10)
+- `WINDOW_SIZE`: Number of segments to keep in the playlist (default: 6)
 - `OUTPUT_DIR`: Directory for output files (default: "output")
-- `DEBUG_MESSAGES`: Enable detailed message logging (default: false)
 
-## How It Works
+#### Logging Configuration:
+- `CAPTIONS_LOG_LEVEL`: Controls visibility of caption text (default: INFO)
+- `SYSTEM_LOG_LEVEL`: Controls system-level messages (default: INFO)
+- `TRANSCRIPTION_LOG_LEVEL`: Controls technical transcription details (default: ERROR)
 
-1. The script initializes a Gladia API session for live transcription
-2. Audio from the HLS stream is extracted using FFmpeg and sent to Gladia
-3. Transcripts and translations are received via WebSocket and broadcast to connected clients
-4. FFmpeg creates separate HLS streams for audio and video
-5. A custom master playlist includes references to the audio/video streams
-6. A web server provides access to the HLS stream with captions
-7. Captions are updated in real-time via WebSocket connections
+Available log levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
 
-## Advanced Usage
+### Logging Examples
 
-### Custom Vocabulary
-
-You can customize the vocabulary to improve transcription of domain-specific terms:
-
-```python
-STREAMING_CONFIGURATION = {
-    # ...
-    "realtime_processing": {
-        "custom_vocabulary": True,
-        "custom_vocabulary_config": {
-            "vocabulary": ["Your", "Custom", "Terms"]
-        },
-        # ...
-    }
-}
+1. Show only captions:
+```bash
+CAPTIONS_LOG_LEVEL=INFO SYSTEM_LOG_LEVEL=ERROR TRANSCRIPTION_LOG_LEVEL=ERROR docker-compose up --build
 ```
 
-### Additional Languages
-
-To add more translation languages, modify the `target_languages` list:
-
-```python
-STREAMING_CONFIGURATION = {
-    # ...
-    "realtime_processing": {
-        # ...
-        "translation": True,
-        "translation_config": {
-            "target_languages": ["en", "fr", "de", "es"]  # Add more languages
-        }
-    }
-}
+2. Show everything (debug mode):
+```bash
+CAPTIONS_LOG_LEVEL=DEBUG SYSTEM_LOG_LEVEL=DEBUG TRANSCRIPTION_LOG_LEVEL=DEBUG docker-compose up --build
 ```
+
+3. Show captions and important system messages:
+```bash
+CAPTIONS_LOG_LEVEL=INFO SYSTEM_LOG_LEVEL=INFO TRANSCRIPTION_LOG_LEVEL=ERROR docker-compose up --build
+```
+
+## Detailed Operation
+
+### INITIAL SETUP (First 60 seconds):
+- FFmpeg starts capturing the live stream and creating 10-second segments
+- Both video and audio are split into separate streams for better handling
+- Video segments go to output/video/
+- Audio segments go to output/audio/
+- The audio is also sent to Gladia for real-time transcription
+- Transcriptions and translations start accumulating in memory
+- Nothing is served yet - http://localhost:8080/master.m3u8 returns 404
+
+### BUFFERING PHASE:
+- Script waits until it has:
+  - 6 complete video segments (60 seconds of content)
+  - Matching audio segments
+  - Transcriptions for this content
+- During this time, it's building three synchronized streams:
+  1. Video segments (.ts files)
+  2. Audio segments (.ts files)
+  3. Caption segments (.vtt files) in three languages (ru, en, nl)
+
+### SERVING STARTS:
+- After 60 seconds, http://localhost:8080/master.m3u8 becomes available
+- When a viewer connects, they see content from 60 seconds ago
+- The master playlist points to:
+  - Video playlist (video/playlist.m3u8)
+  - Audio playlist (audio/playlist.m3u8)
+  - Subtitle playlists (subtitles/{lang}/playlist.m3u8)
+
+### CONTINUOUS OPERATION:
+- At any given moment:
+  - Viewers are watching segment N
+  - FFmpeg is creating segment N+6
+  - Gladia is transcribing segment N+6
+  - VTT files are being prepared for segment N+6
+- Each 10-second segment has:
+  - A video file
+  - An audio file
+  - Three VTT files (Russian, English, Dutch)
+- The playlists maintain a rolling window of 6 segments
+- Old segments are automatically removed
+
+### VIEWER EXPERIENCE:
+- Viewer opens http://localhost:8080 in their browser
+- Player loads master.m3u8 and all necessary streams
+- Content starts playing from 60 seconds ago
+- Captions are available immediately through native HLS subtitle support
+- Viewers can switch between languages using the player controls
+- Stream maintains consistent 60-second delay throughout playback
+
+This architecture ensures that by the time any segment reaches the viewer, its captions are already prepared, synchronized, and ready to display, providing a smooth viewing experience despite the complexity of live transcription and translation.
 
 ## Troubleshooting
 
-- **No captions appear**: Check the console for error messages. Make sure the Gladia API key is valid and WebSocket connection is established.
-- **Stream doesn't play**: Verify that the HLS source URL is accessible and that FFmpeg is properly creating the output streams.
+- **No captions appear**: Check the logs with `TRANSCRIPTION_LOG_LEVEL=DEBUG` to see if transcriptions are being received and processed correctly.
+- **Stream doesn't play**: Verify that the HLS source URL is accessible and check system logs with `SYSTEM_LOG_LEVEL=DEBUG`.
 - **Multiple captions showing**: Only one caption track should be active at a time. Use the language buttons to switch between tracks.
 - **Container fails to start**: Ensure all required ports are available and the environment variables are set correctly.
 

@@ -29,17 +29,41 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 import uvicorn
 import logging
 
-# === Configure Logging ===
-os.makedirs("logs", exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("logs/rainscribe.log", mode="w"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("rainscribe")
+# === Logging Configuration ===
+LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL
+}
+
+# Create different loggers for different types of messages
+captions_logger = logging.getLogger('captions')
+system_logger = logging.getLogger('system')
+transcription_logger = logging.getLogger('transcription')
+
+def setup_logging():
+    """Configure the logging system based on environment variables."""
+    # Get log levels from environment variables, default to INFO if not set
+    captions_level = os.getenv('CAPTIONS_LOG_LEVEL', 'INFO')
+    system_level = os.getenv('SYSTEM_LOG_LEVEL', 'INFO')
+    transcription_level = os.getenv('TRANSCRIPTION_LOG_LEVEL', 'INFO')
+
+    # Configure handlers and formatters
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+
+    # Setup individual loggers
+    for logger_name, level in [
+        (captions_logger, captions_level),
+        (system_logger, system_level),
+        (transcription_logger, transcription_level)
+    ]:
+        logger_name.addHandler(handler)
+        logger_name.setLevel(LOG_LEVELS.get(level, logging.INFO))
+        logger_name.propagate = False  # Prevent duplicate logging
 
 # === Configuration Constants ===
 GLADIA_API_URL = "https://api.gladia.io"
@@ -116,7 +140,7 @@ def get_gladia_key() -> str:
         return env_key
         
     if len(sys.argv) != 2 or not sys.argv[1]:
-        logger.error("You must provide a Gladia key as the first argument or set GLADIA_API_KEY environment variable.")
+        system_logger.error("You must provide a Gladia key as the first argument or set GLADIA_API_KEY environment variable.")
         sys.exit(1)
     return sys.argv[1]
 
@@ -140,13 +164,13 @@ def format_duration(seconds: float) -> str:
         
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
     except (ValueError, TypeError) as e:
-        logger.error(f"Invalid timestamp value: {seconds}. Error: {e}")
+        system_logger.error(f"Invalid timestamp value: {seconds}. Error: {e}")
         return "00:00:00.000"
 
 def init_live_session(config: Dict[str, Any]) -> Dict[str, str]:
     """Initialize a live transcription session with the Gladia API."""
     gladia_key = get_gladia_key()
-    logger.info("Initializing Gladia live transcription session")
+    system_logger.info("Initializing Gladia live transcription session")
     try:
         response = requests.post(
             f"{GLADIA_API_URL}/v2/live",
@@ -155,11 +179,11 @@ def init_live_session(config: Dict[str, Any]) -> Dict[str, str]:
             timeout=10,
         )
         if not response.ok:
-            logger.error(f"Gladia API error: {response.status_code}: {response.text or response.reason}")
+            system_logger.error(f"Gladia API error: {response.status_code}: {response.text or response.reason}")
             sys.exit(response.status_code)
         return response.json()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to initialize Gladia session: {e}")
+        system_logger.error(f"Failed to initialize Gladia session: {e}")
         sys.exit(1)
 
 def normalize_segment_number(segment_number: int) -> int:
@@ -168,7 +192,7 @@ def normalize_segment_number(segment_number: int) -> int:
     
     if first_segment_timestamp is None:
         first_segment_timestamp = segment_number
-        logger.info(f"First segment timestamp set to: {first_segment_timestamp}")
+        system_logger.info(f"First segment timestamp set to: {first_segment_timestamp}")
     
     return segment_number - first_segment_timestamp
 
@@ -184,9 +208,9 @@ def cleanup_old_directories():
         for dir_path in [VIDEO_DIR, AUDIO_DIR, SUBTITLE_BASE_DIR]:
             if os.path.exists(dir_path):
                 shutil.rmtree(dir_path)
-                logger.info(f"Cleaned up directory: {dir_path}")
+                system_logger.info(f"Cleaned up directory: {dir_path}")
     except Exception as e:
-        logger.error(f"Error cleaning up directories: {e}")
+        system_logger.error(f"Error cleaning up directories: {e}")
 
 def ensure_directories_exist():
     """Ensure all required directories exist."""
@@ -217,7 +241,7 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
         "pipe:1",
     ]
     
-    logger.info(f"Starting audio extraction for Gladia: {' '.join(ffmpeg_command)}")
+    system_logger.info(f"Starting audio extraction for Gladia: {' '.join(ffmpeg_command)}")
     
     process = subprocess.Popen(
         ffmpeg_command,
@@ -227,7 +251,7 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
     )
     
     ffmpeg_processes["gladia_audio"] = process
-    logger.info("Started FFmpeg process for direct audio streaming to Gladia")
+    system_logger.info("Started FFmpeg process for direct audio streaming to Gladia")
     
     # Calculate the chunk size based on configuration (100ms chunks)
     chunk_size = int(
@@ -246,32 +270,32 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
             if not audio_chunk:
                 stderr = process.stderr.read()
                 if stderr:
-                    logger.error(f"FFmpeg audio streaming error: {stderr.decode()}")
+                    system_logger.error(f"FFmpeg audio streaming error: {stderr.decode()}")
                 break
             
             try:
                 await websocket.send(audio_chunk)
                 await asyncio.sleep(0.1)  # Control flow rate
             except ConnectionClosedOK:
-                logger.info("Gladia WebSocket connection closed")
+                system_logger.info("Gladia WebSocket connection closed")
                 break
             except Exception as e:
-                logger.error(f"Error sending audio to Gladia: {e}")
+                system_logger.error(f"Error sending audio to Gladia: {e}")
                 break
         
-        logger.info("Finished sending audio data to Gladia")
+        system_logger.info("Finished sending audio data to Gladia")
     
     except Exception as e:
-        logger.error(f"Error in audio streaming: {e}")
+        system_logger.error(f"Error in audio streaming: {e}")
     finally:
         try:
             await stop_recording(websocket)
         except Exception as e:
-            logger.error(f"Error stopping recording: {e}")
+            system_logger.error(f"Error stopping recording: {e}")
         
         if process and process.poll() is None:
             process.terminate()
-            logger.info("Terminated audio extraction process")
+            system_logger.info("Terminated audio extraction process")
 
 async def process_transcription_messages(websocket: WebSocketClientProtocol) -> None:
     """
@@ -280,7 +304,7 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
     """
     global transcription_start_time, segment_time_offset, initialization_complete
     
-    logger.info("Starting to process transcription messages from Gladia")
+    transcription_logger.info("Starting to process transcription messages from Gladia")
     
     # Function to normalize and synchronize timestamps
     def normalize_timestamp(ts):
@@ -312,20 +336,20 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                 # Initialize timing reference on first transcript
                 if transcription_start_time is None:
                     transcription_start_time = float(start)
-                    logger.info(f"Initialized transcription_start_time to {transcription_start_time}")
+                    transcription_logger.info(f"Initialized transcription_start_time to {transcription_start_time}")
                     
                     # We need to synchronize with segment timestamps once they're available
                     if first_segment_timestamp is not None:
                         # Simple offset to align transcription with segments
                         segment_time_offset = 0  # Start with no offset
-                        logger.info(f"Timing references initialized - first transcript at {start}s, first segment at {first_segment_timestamp}")
+                        transcription_logger.info(f"Timing references initialized - first transcript at {start}s, first segment at {first_segment_timestamp}")
                 
                 # Normalize timestamps to stream timeline
                 stream_relative_start = normalize_timestamp(start)
                 stream_relative_end = normalize_timestamp(end)
                 
-                # Always log transcription data for debugging
-                logger.info(f"[RU] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                # Log transcription data
+                captions_logger.info(f"[RU] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
                 
                 # Store the cue with normalized stream timestamps
                 await store_caption_cue("ru", stream_relative_start, stream_relative_end, text)
@@ -333,7 +357,7 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                 # Assess transcription buffer status against initialization threshold
                 if not initialization_complete and len(caption_cues["ru"]) >= TRANSCRIPTION_BUFFER_MIN:
                     initialization_complete = True
-                    logger.info(f"Transcription buffer threshold achieved: {len(caption_cues['ru'])} cues accumulated")
+                    transcription_logger.info(f"Transcription buffer threshold achieved: {len(caption_cues['ru'])} cues accumulated")
             
             # Handle translations (English and Dutch)
             elif msg_type == "translation":
@@ -353,7 +377,7 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                         stream_relative_end = normalize_timestamp(end)
                         
                         if lang in ["en", "nl"] and text:
-                            logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                            captions_logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
                             await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
                     
                     # Format 2: Alternative structure (backup compatibility)
@@ -376,22 +400,22 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                         lang = translation["target_language"]
                         
                         if lang in ["en", "nl"] and text:
-                            logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
+                            captions_logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
                             await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
                 
                 except Exception as e:
-                    logger.error(f"Error processing translation: {e}")
-                    logger.error(f"Translation message content: {json.dumps(content, indent=2)}")
+                    transcription_logger.error(f"Error processing translation: {e}")
+                    transcription_logger.error(f"Translation message content: {json.dumps(content, indent=2)}")
             
             # Debug end-of-session message
             elif msg_type == "post_final_transcript":
-                logger.info("\n#### End of session ####\n")
-                logger.info(json.dumps(content, indent=2, ensure_ascii=False))
+                transcription_logger.info("\n#### End of session ####\n")
+                transcription_logger.debug(json.dumps(content, indent=2, ensure_ascii=False))
         
         except json.JSONDecodeError:
-            logger.error("Failed to decode message from Gladia")
+            transcription_logger.error("Failed to decode message from Gladia")
         except Exception as e:
-            logger.error(f"Error processing message from Gladia: {e}")
+            transcription_logger.error(f"Error processing message from Gladia: {e}")
 
 async def store_caption_cue(language, start_time, end_time, text):
     """Store a caption cue in memory and update corresponding VTT files if needed."""
@@ -401,7 +425,7 @@ async def store_caption_cue(language, start_time, end_time, text):
         end_time = float(end_time)
         
         if end_time <= start_time:
-            logger.warning(f"Invalid timestamps: {start_time} -> {end_time}, adjusting end time")
+            transcription_logger.warning(f"Invalid timestamps: {start_time} -> {end_time}, adjusting end time")
             end_time = start_time + 1.0  # Ensure at least 1 second duration
         
         # Add to in-memory caption store
@@ -412,16 +436,16 @@ async def store_caption_cue(language, start_time, end_time, text):
         })
         
         # Log caption storage for debugging
-        logger.info(f"Stored {language} caption: {format_duration(start_time)} -> {format_duration(end_time)}: {text[:30]}...")
-        logger.info(f"Total {language} captions in memory: {len(caption_cues[language])}")
+        transcription_logger.debug(f"Stored {language} caption: {format_duration(start_time)} -> {format_duration(end_time)}: {text[:30]}...")
+        transcription_logger.debug(f"Total {language} captions in memory: {len(caption_cues[language])}")
         
         # For any existing segments that might contain this caption, update their VTT files
         if first_segment_timestamp is not None:
             await update_overlapping_vtt_segments(language, start_time, end_time)
         else:
-            logger.warning("Cannot update VTT segments: first_segment_timestamp not initialized")
+            transcription_logger.warning("Cannot update VTT segments: first_segment_timestamp not initialized")
     except Exception as e:
-        logger.error(f"Error storing caption cue: {e}")
+        transcription_logger.error(f"Error storing caption cue: {e}")
 
 async def update_overlapping_vtt_segments(language, start_time, end_time):
     """Update any VTT segments that would contain this caption timespan."""
@@ -429,7 +453,7 @@ async def update_overlapping_vtt_segments(language, start_time, end_time):
         # Get current video segments from playlist
         video_playlist_path = os.path.join(VIDEO_DIR, "playlist.m3u8")
         if not os.path.exists(video_playlist_path):
-            logger.warning(f"Video playlist not found, cannot update VTT segments")
+            transcription_logger.warning(f"Video playlist not found, cannot update VTT segments")
             return
         
         current_segments = []
@@ -441,11 +465,11 @@ async def update_overlapping_vtt_segments(language, start_time, end_time):
                     current_segments.append(seg_num)
         
         if not current_segments:
-            logger.warning(f"No segments found in playlist, cannot update VTT segments")
+            transcription_logger.warning(f"No segments found in playlist, cannot update VTT segments")
             return
             
-        logger.info(f"Found {len(current_segments)} current segments: {current_segments}")
-        logger.info(f"Checking for segments overlapping with caption: {format_duration(start_time)} -> {format_duration(end_time)}")
+        transcription_logger.debug(f"Found {len(current_segments)} current segments: {current_segments}")
+        transcription_logger.debug(f"Checking for segments overlapping with caption: {format_duration(start_time)} -> {format_duration(end_time)}")
         
         # For each segment, check if it overlaps with the caption timespan
         segments_updated = []
@@ -453,14 +477,14 @@ async def update_overlapping_vtt_segments(language, start_time, end_time):
             segment_start = (seg_num - first_segment_timestamp) * SEGMENT_DURATION
             segment_end = segment_start + SEGMENT_DURATION
             
-            logger.info(f"Checking segment {seg_num}: {format_duration(segment_start)} -> {format_duration(segment_end)}")
+            transcription_logger.debug(f"Checking segment {seg_num}: {format_duration(segment_start)} -> {format_duration(segment_end)}")
             
             # Check for overlap with caption timespan (use more flexible matching)
             if (start_time >= segment_start - 5 and start_time < segment_end + 5) or \
                (end_time > segment_start - 5 and end_time <= segment_end + 5) or \
                (start_time <= segment_start + 5 and end_time >= segment_end - 5):
                 
-                logger.info(f"Found overlap! Updating {language} segment {seg_num}")
+                transcription_logger.debug(f"Found overlap! Updating {language} segment {seg_num}")
                 # This segment needs to be updated
                 success = await create_vtt_segment(seg_num, language)
                 if success:
@@ -469,28 +493,28 @@ async def update_overlapping_vtt_segments(language, start_time, end_time):
         # If no segments were updated due to the flexible matching, update the latest segment as fallback
         if not segments_updated and current_segments:
             latest_segment = max(current_segments)
-            logger.info(f"No overlapping segments found, updating latest segment {latest_segment} as fallback")
+            transcription_logger.info(f"No overlapping segments found, updating latest segment {latest_segment} as fallback")
             await create_vtt_segment(latest_segment, language)
             segments_updated.append(latest_segment)
         
         # Update the subtitle playlist after any changes
         if segments_updated:
-            logger.info(f"Updated segments {segments_updated}, updating subtitle playlist")
+            transcription_logger.debug(f"Updated segments {segments_updated}, updating subtitle playlist")
             await update_subtitle_playlist(language)
         else:
-            logger.warning(f"No segments were updated for caption at {format_duration(start_time)}")
+            transcription_logger.warning(f"No segments were updated for caption at {format_duration(start_time)}")
     
     except Exception as e:
-        logger.error(f"Error updating overlapping VTT segments: {e}")
+        transcription_logger.error(f"Error updating overlapping VTT segments: {e}")
 
 async def stop_recording(websocket: WebSocketClientProtocol) -> None:
     """Send a stop recording signal to Gladia."""
-    logger.info("Ending the recording session...")
+    system_logger.info("Ending the recording session...")
     try:
         await websocket.send(json.dumps({"type": "stop_recording"}))
         await asyncio.sleep(0.5)  # Give it time to process
     except Exception as e:
-        logger.error(f"Error sending stop recording signal: {e}")
+        system_logger.error(f"Error sending stop recording signal: {e}")
 
 # === HLS and Subtitle Generation ===
 async def create_hls_stream():
@@ -538,8 +562,8 @@ async def create_hls_stream():
         os.path.join(VIDEO_DIR, "playlist.m3u8")
     ]
 
-    logger.info("Starting FFmpeg for HLS stream generation")
-    logger.info(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
+    system_logger.info("Starting FFmpeg for HLS stream generation")
+    system_logger.debug(f"FFmpeg Command: {' '.join(ffmpeg_command)}")
     
     try:
         # Start FFmpeg process with real-time error output
@@ -561,29 +585,29 @@ async def create_hls_stream():
         while True:
             line = process.stderr.readline()
             if not line and process.poll() is not None:
-                logger.error("FFmpeg process ended unexpectedly")
+                system_logger.error("FFmpeg process ended unexpectedly")
                 raise RuntimeError("FFmpeg process failed")
             if line:
                 if DEBUG_MESSAGES:
-                    logger.info(f"FFmpeg: {line.strip()}")
+                    system_logger.debug(f"FFmpeg: {line.strip()}")
             
             # Check if FFmpeg process has failed
             if process.poll() is not None:
                 stderr = process.stderr.read()
-                logger.error(f"FFmpeg process failed: {stderr}")
+                system_logger.error(f"FFmpeg process failed: {stderr}")
                 break
             
             await asyncio.sleep(0.1)
     
     except Exception as e:
-        logger.error(f"Error in HLS stream generation: {e}")
+        system_logger.error(f"Error in HLS stream generation: {e}")
         raise
     
     finally:
         # Cleanup processes
         if process and process.poll() is None:
             process.terminate()
-            logger.info("Terminated HLS generation process")
+            system_logger.info("Terminated HLS generation process")
 
 async def create_master_playlist():
     """Create the master playlist with subtitle tracks."""
@@ -612,12 +636,12 @@ async def create_master_playlist():
     async with aiofiles.open(master_playlist_path, "w") as f:
         await f.write(content)
     
-    logger.info("Created master playlist with subtitle tracks")
+    system_logger.info("Created master playlist with subtitle tracks")
 
 async def create_vtt_segment(segment_number, language="ru"):
     """Create a WebVTT segment file for the given segment number and language."""
     if first_segment_timestamp is None:
-        logger.warning(f"Cannot create VTT segment: first_segment_timestamp not initialized")
+        transcription_logger.warning(f"Cannot create VTT segment: first_segment_timestamp not initialized")
         return False
         
     try:
@@ -625,8 +649,8 @@ async def create_vtt_segment(segment_number, language="ru"):
         segment_start_time = (segment_number - first_segment_timestamp) * SEGMENT_DURATION
         segment_end_time = segment_start_time + SEGMENT_DURATION
         
-        logger.info(f"Creating {language} VTT for segment {segment_number}")
-        logger.info(f"Segment time window: {format_duration(segment_start_time)} -> {format_duration(segment_end_time)}")
+        transcription_logger.debug(f"Creating {language} VTT for segment {segment_number}")
+        transcription_logger.debug(f"Segment time window: {format_duration(segment_start_time)} -> {format_duration(segment_end_time)}")
         
         content = "WEBVTT\n\n"
         cue_index = 1
@@ -639,27 +663,27 @@ async def create_vtt_segment(segment_number, language="ru"):
                 
                 # Skip invalid cues
                 if cue_end <= cue_start:
-                    logger.warning(f"Skipping invalid cue: start={cue_start}, end={cue_end}")
+                    transcription_logger.warning(f"Skipping invalid cue: start={cue_start}, end={cue_end}")
                     continue
                 
                 # Strict overlap check - the cue must actually overlap with this segment
                 if cue_start < segment_end_time and cue_end > segment_start_time:
                     # Log the overlap check for debugging
-                    logger.info(f"Checking cue overlap: cue={cue_start}->{cue_end} segment={segment_start_time}->{segment_end_time}")
+                    transcription_logger.debug(f"Checking cue overlap: cue={cue_start}->{cue_end} segment={segment_start_time}->{segment_end_time}")
                     
                     # Calculate relative timing
                     relative_start = cue_start - segment_start_time
                     relative_end = cue_end - segment_start_time
                     
-                    logger.info(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
-                    logger.info(f"Text: {cue['text']}")
+                    transcription_logger.debug(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
+                    transcription_logger.debug(f"Text: {cue['text']}")
                     
                     content += f"{cue_index}\n"
                     content += f"{format_duration(relative_start)} --> {format_duration(relative_end)}\n"
                     content += f"{cue['text']}\n\n"
                     cue_index += 1
             except (ValueError, KeyError) as e:
-                logger.error(f"Error processing cue: {e}")
+                transcription_logger.error(f"Error processing cue: {e}")
                 continue
         
         # Write the segment file
@@ -667,11 +691,11 @@ async def create_vtt_segment(segment_number, language="ru"):
         async with aiofiles.open(segment_path, "w", encoding="utf-8") as f:
             await f.write(content)
             
-        logger.info(f"Created {language} segment {segment_number} with {cue_index-1} cues")
+        transcription_logger.debug(f"Created {language} segment {segment_number} with {cue_index-1} cues")
         return True
         
     except Exception as e:
-        logger.error(f"Error in create_vtt_segment: {str(e)}")
+        transcription_logger.error(f"Error in create_vtt_segment: {str(e)}")
         return False
 
 async def update_subtitle_playlist(language="ru"):
@@ -712,7 +736,7 @@ async def update_subtitle_playlist(language="ru"):
         await f.write(content)
     
     if DEBUG_MESSAGES:
-        logger.info(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
+        system_logger.info(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
 
 async def monitor_segments_and_create_vtt():
     """
@@ -731,12 +755,12 @@ async def monitor_segments_and_create_vtt():
             video_playlist = os.path.join(VIDEO_DIR, "playlist.m3u8")
             if not os.path.exists(video_playlist):
                 if retry_count < max_retries:
-                    logger.info("Video playlist not found, waiting...")
+                    system_logger.info("Video playlist not found, waiting...")
                     retry_count += 1
                     await asyncio.sleep(1)
                     continue
                 else:
-                    logger.error(f"Video playlist not found after {max_retries} attempts")
+                    system_logger.error(f"Video playlist not found after {max_retries} attempts")
                     return
             
             retry_count = 0  # Reset retry count when successful
@@ -751,37 +775,37 @@ async def monitor_segments_and_create_vtt():
             
             # Proceed only when segment data is available for synchronization
             if not current_segments:
-                logger.info("Waiting for initial segment creation to establish temporal reference frame...")
+                system_logger.info("Waiting for initial segment creation to establish temporal reference frame...")
                 await asyncio.sleep(1)
                 continue
             
             # Initialize first_segment_timestamp if not set
             if first_segment_timestamp is None and current_segments:
                 first_segment_timestamp = min(current_segments)
-                logger.info(f"Initialized first_segment_timestamp to {first_segment_timestamp}")
+                system_logger.info(f"Initialized first_segment_timestamp to {first_segment_timestamp}")
                 
                 # Important: Synchronize timing references
                 if transcription_start_time is not None:
                     # Initialize with a simpler approach - just using normalized timestamps
                     segment_time_offset = 0
-                    logger.info(f"Initialized segment_time_offset to 0 for simplified timestamp normalization")
-                    logger.info(f"Transcription start time: {transcription_start_time}, First segment: {first_segment_timestamp}")
+                    system_logger.info(f"Initialized segment_time_offset to 0 for simplified timestamp normalization")
+                    system_logger.info(f"Transcription start time: {transcription_start_time}, First segment: {first_segment_timestamp}")
             
-            logger.info(f"Current segments: {current_segments}")
-            logger.info(f"Processed segments: {processed_segments}")
+            system_logger.info(f"Current segments: {current_segments}")
+            system_logger.info(f"Processed segments: {processed_segments}")
             
             # Force recreation of all subtitle segments periodically to ensure they have the latest captions
             force_update_all = len(processed_segments) % 10 == 0
             if force_update_all:
-                logger.info("Periodic full update of all subtitle segments")
+                system_logger.info("Periodic full update of all subtitle segments")
             
             # Process new or updated segments
             for seg_num in current_segments:
                 if seg_num not in processed_segments or force_update_all:
                     if seg_num not in processed_segments:
-                        logger.info(f"Processing new segment: {seg_num}")
+                        system_logger.info(f"Processing new segment: {seg_num}")
                     else:
-                        logger.info(f"Refreshing segment: {seg_num}")
+                        system_logger.info(f"Refreshing segment: {seg_num}")
                     
                     # Create VTT segments for all languages
                     all_successful = True
@@ -799,7 +823,7 @@ async def monitor_segments_and_create_vtt():
                     if not ready_to_serve and len(processed_segments) >= REQUIRED_BUFFER_SEGMENTS:
                         if initialization_complete and all_successful:  # Verify transcription data availability
                             ready_to_serve = True
-                            logger.info(f"Buffer initialization complete: {len(processed_segments)} segments with synchronized transcriptions")
+                            system_logger.info(f"Buffer initialization complete: {len(processed_segments)} segments with synchronized transcriptions")
             
             # Clean up old segments
             if current_segments:
@@ -809,7 +833,7 @@ async def monitor_segments_and_create_vtt():
             await asyncio.sleep(1)  # Check every second
             
         except Exception as e:
-            logger.error(f"Error in segment monitoring: {str(e)}")
+            system_logger.error(f"Error in segment monitoring: {str(e)}")
             await asyncio.sleep(1)
 
 # === FastAPI Server ===
@@ -1103,7 +1127,10 @@ async def transcription_main():
     """
     global ffmpeg_processes, ready_to_serve
     
-    logger.info("\n===== Starting Rainscribe with native HLS subtitle integration =====")
+    system_logger.info("\n===== Starting Rainscribe with native HLS subtitle integration =====")
+    
+    # Setup logging first
+    setup_logging()
     
     # Clear existing files and create directories
     cleanup_old_directories()
@@ -1115,11 +1142,11 @@ async def transcription_main():
         
         # Initialize Gladia transcription session
         response = init_live_session(STREAMING_CONFIGURATION)
-        logger.info(f"Gladia session initialized: {response['id']}")
+        transcription_logger.info(f"Gladia session initialized: {response['id']}")
         
         # Start transcription and VTT generation
         async with ws_connect(response["url"]) as websocket:
-            logger.info("\n===== Transcription session started =====")
+            transcription_logger.info("\n===== Transcription session started =====")
             
             # Start tasks in parallel
             message_task = asyncio.create_task(process_transcription_messages(websocket))
@@ -1127,22 +1154,22 @@ async def transcription_main():
             segment_monitor_task = asyncio.create_task(monitor_segments_and_create_vtt())
             
             # Start web server
-            logger.info("Starting web server...")
+            system_logger.info("Starting web server...")
             web_server_task = asyncio.create_task(start_web_server())
             
             # Wait for all tasks
             await asyncio.gather(message_task, audio_task, web_server_task, hls_task, segment_monitor_task)
             
     except asyncio.CancelledError:
-        logger.info("Tasks cancelled - shutting down...")
+        system_logger.info("Tasks cancelled - shutting down...")
     except Exception as e:
-        logger.error(f"Error in main process: {e}")
+        system_logger.error(f"Error in main process: {e}")
     finally:
         # Cleanup all processes
         for name, process in ffmpeg_processes.items():
             if process and process.poll() is None:
                 process.terminate()
-                logger.info(f"Terminated {name} process")
+                system_logger.info(f"Terminated {name} process")
 
 async def start_web_server():
     """Start the FastAPI web server."""
@@ -1153,11 +1180,11 @@ async def start_web_server():
 # === Signal Handling ===
 def handle_exit(*args):
     """Handle exit signals gracefully."""
-    logger.info("Received exit signal, cleaning up...")
+    system_logger.info("Received exit signal, cleaning up...")
     for name, process in ffmpeg_processes.items():
         if process and process.poll() is None:
             process.terminate()
-            logger.info(f"Terminated {name} process")
+            system_logger.info(f"Terminated {name} process")
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -1168,5 +1195,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(transcription_main())
     except KeyboardInterrupt:
-        logger.info("\nShutting down gracefully...")
+        system_logger.info("\nShutting down gracefully...")
         sys.exit(0)

@@ -4,7 +4,6 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
-    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up app directory
@@ -33,6 +32,9 @@ EXPOSE 8080
 # Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV OUTPUT_DIR=/app/output
+ENV CAPTIONS_LOG_LEVEL=INFO
+ENV SYSTEM_LOG_LEVEL=INFO
+ENV TRANSCRIPTION_LOG_LEVEL=ERROR
 
 # Switch to non-root user
 USER rainscribe
