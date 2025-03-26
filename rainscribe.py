@@ -658,12 +658,17 @@ async def create_vtt_segment(segment_number, language="ru"):
                 
                 # Strict overlap check - the cue must actually overlap with this segment
                 if cue_start < segment_end_time and cue_end > segment_start_time:
-                    # Log the overlap check for debugging
-                    transcription_logger.debug(f"Checking cue overlap: cue={cue_start}->{cue_end} segment={segment_start_time}->{segment_end_time}")
+                    # Calculate relative timing and clamp to segment boundaries
+                    relative_start = max(0.0, cue_start - segment_start_time)
+                    relative_end = min(SEGMENT_DURATION, cue_end - segment_start_time)
                     
-                    # Calculate relative timing
-                    relative_start = cue_start - segment_start_time
-                    relative_end = cue_end - segment_start_time
+                    # Handle case where cue carries over from previous segment
+                    if cue_start < segment_start_time:
+                        relative_start = 0.0
+                    
+                    # Handle case where cue carries over to next segment
+                    if cue_end > segment_end_time:
+                        relative_end = float(SEGMENT_DURATION)
                     
                     transcription_logger.debug(f"Adding cue: {format_duration(relative_start)} -> {format_duration(relative_end)}")
                     transcription_logger.debug(f"Text: {cue['text']}")
