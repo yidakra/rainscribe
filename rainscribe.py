@@ -1115,11 +1115,7 @@ async def generate_player_html():
 
 # === Main Application Flow ===
 async def transcription_main():
-    """
-    Main function to coordinate the transcription and HLS generation process.
-    This implements the parallel processing approach where audio extraction for
-    transcription happens independently from HLS segment creation.
-    """
+    """Main function to coordinate the transcription and HLS generation process."""
     global ffmpeg_processes, ready_to_serve
     
     system_logger.info("\n===== Starting Rainscribe with native HLS subtitle integration =====")
@@ -1132,8 +1128,13 @@ async def transcription_main():
     ensure_directories_exist()
     
     try:
-        # Start FFmpeg for HLS generation (run in background)
+        # Start web server first
+        web_server_task = asyncio.create_task(start_web_server())
+        await asyncio.sleep(1)  # Give the web server a moment to start
+        
+        # Start FFmpeg for HLS generation
         hls_task = asyncio.create_task(create_hls_stream())
+        await asyncio.sleep(2)  # Give FFmpeg time to start creating segments
         
         # Initialize Gladia transcription session
         response = init_live_session(STREAMING_CONFIGURATION)
@@ -1144,16 +1145,16 @@ async def transcription_main():
             transcription_logger.info("\n===== Transcription session started =====")
             
             # Start tasks in parallel
-            message_task = asyncio.create_task(process_transcription_messages(websocket))
-            audio_task = asyncio.create_task(stream_audio_to_gladia(websocket))
-            segment_monitor_task = asyncio.create_task(monitor_segments_and_create_vtt())
+            tasks = [
+                web_server_task,
+                hls_task,
+                asyncio.create_task(process_transcription_messages(websocket)),
+                asyncio.create_task(stream_audio_to_gladia(websocket)),
+                asyncio.create_task(monitor_segments_and_create_vtt())
+            ]
             
-            # Start web server
-            system_logger.info("Starting web server...")
-            web_server_task = asyncio.create_task(start_web_server())
-            
-            # Wait for all tasks
-            await asyncio.gather(message_task, audio_task, web_server_task, hls_task, segment_monitor_task)
+            # Wait for any task to complete (which shouldn't happen unless there's an error)
+            await asyncio.gather(*tasks, return_exceptions=True)
             
     except asyncio.CancelledError:
         system_logger.info("Tasks cancelled - shutting down...")
