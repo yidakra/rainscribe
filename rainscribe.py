@@ -225,14 +225,14 @@ def ensure_directories_exist():
 async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
     """
     Stream audio directly from the source HLS to Gladia for real-time transcription.
-    This approach avoids the circular dependency by not using the processed segments.
+    Uses a dedicated FFmpeg instance for low-latency transcription.
     """
     global ffmpeg_processes
     
-    # FFmpeg command to extract audio directly from source and output PCM
+    # FFmpeg command optimized for real-time streaming to Gladia
     ffmpeg_command = [
         "ffmpeg", "-re",
-        "-i", STREAM_URL,  # Use original stream as source
+        "-i", STREAM_URL,
         "-ar", str(STREAMING_CONFIGURATION["sample_rate"]),
         "-ac", str(STREAMING_CONFIGURATION["channels"]),
         "-acodec", "pcm_s16le",
@@ -241,7 +241,7 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
         "pipe:1",
     ]
     
-    system_logger.info(f"Starting audio extraction for Gladia: {' '.join(ffmpeg_command)}")
+    system_logger.info(f"Starting direct audio streaming to Gladia")
     
     process = subprocess.Popen(
         ffmpeg_command,
@@ -251,22 +251,14 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
     )
     
     ffmpeg_processes["gladia_audio"] = process
-    system_logger.info("Started FFmpeg process for direct audio streaming to Gladia")
-    
-    # Calculate the chunk size based on configuration (100ms chunks)
-    chunk_size = int(
-        STREAMING_CONFIGURATION["sample_rate"]
-        * (STREAMING_CONFIGURATION["bit_depth"] / 8)
-        * STREAMING_CONFIGURATION["channels"]
-        * 0.1
-    )
     
     try:
-        # Skip WAV header (44 bytes) to avoid confusion
+        # Skip WAV header (44 bytes)
         header = process.stdout.read(44)
         
         while True:
-            audio_chunk = process.stdout.read(chunk_size)
+            # Stream raw audio data directly
+            audio_chunk = process.stdout.read(4096)  # Use larger chunks for efficiency
             if not audio_chunk:
                 stderr = process.stderr.read()
                 if stderr:
@@ -275,15 +267,13 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
             
             try:
                 await websocket.send(audio_chunk)
-                await asyncio.sleep(0.1)  # Control flow rate
+                await asyncio.sleep(0.01)  # Reduced sleep time for lower latency
             except ConnectionClosedOK:
                 system_logger.info("Gladia WebSocket connection closed")
                 break
             except Exception as e:
                 system_logger.error(f"Error sending audio to Gladia: {e}")
                 break
-        
-        system_logger.info("Finished sending audio data to Gladia")
     
     except Exception as e:
         system_logger.error(f"Error in audio streaming: {e}")
@@ -295,7 +285,7 @@ async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
         
         if process and process.poll() is None:
             process.terminate()
-            system_logger.info("Terminated audio extraction process")
+            system_logger.info("Terminated direct audio streaming process")
 
 async def process_transcription_messages(websocket: WebSocketClientProtocol) -> None:
     """
@@ -520,14 +510,14 @@ async def stop_recording(websocket: WebSocketClientProtocol) -> None:
 async def create_hls_stream():
     """
     Create the HLS stream with separate audio and video tracks.
-    This runs independently from the transcription process.
+    This FFmpeg instance handles segment creation independently from transcription.
     """
     global ffmpeg_processes, stream_start_time
     
     # Set up directories
     ensure_directories_exist()
     
-    # Start HLS generation with FFmpeg
+    # FFmpeg command for HLS segment creation
     ffmpeg_command = [
         "ffmpeg", "-y",
         "-reconnect", "1",
