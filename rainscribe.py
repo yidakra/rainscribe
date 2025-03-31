@@ -25,9 +25,93 @@ import requests
 from websockets.legacy.client import WebSocketClientProtocol, connect as ws_connect
 from websockets.exceptions import ConnectionClosedOK
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 import uvicorn
 import logging
+
+# === File Access Coordination ===
+class FileAccessCoordinator:
+    """Coordinates access to files to prevent race conditions."""
+    def __init__(self):
+        self._locks = {}  # Path-based locks
+        self._master_lock = asyncio.Lock()
+    
+    async def acquire_lock(self, path):
+        """Acquire a lock for a specific file path."""
+        async with self._master_lock:
+            if path not in self._locks:
+                self._locks[path] = asyncio.Lock()
+        return await self._locks[path].acquire()
+    
+    def release_lock(self, path):
+        """Release a lock for a specific file path."""
+        if path in self._locks:
+            self._locks[path].release()
+    
+    async def __aenter__(self):
+        """Context manager support."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Ensure all locks are released."""
+        async with self._master_lock:
+            for lock in self._locks.values():
+                if lock.locked():
+                    lock.release()
+
+# Create a global file coordinator instance
+file_coordinator = FileAccessCoordinator()
+
+async def atomic_file_write(path, content):
+    """Write content to a file atomically using a temporary file."""
+    temp_path = f"{path}.tmp"
+    
+    # Ensure parent directory exists
+    parent_dir = os.path.dirname(path)
+    os.makedirs(parent_dir, exist_ok=True)
+    
+    try:
+        async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+            await f.write(content)
+        os.replace(temp_path, path)  # Atomic operation on most file systems
+    except Exception as e:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass  # Best effort cleanup, ignore errors during cleanup
+        raise e
+
+async def atomic_file_write_with_retry(path, content, max_retries=3, retry_delay=0.5):
+    """Write content to a file atomically with retries for resilience."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            await atomic_file_write(path, content)
+            return  # Success
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries - 1:  # Last attempt
+                break
+            
+            # Log and retry
+            transcription_logger.warning(f"File operation failed (attempt {attempt+1}/{max_retries}): {e}")
+            await asyncio.sleep(retry_delay)
+    
+    # If we get here, all retries failed
+    raise last_error
+
+async def safe_read_file(path):
+    """Read a file safely with proper locking."""
+    async with file_coordinator:
+        await file_coordinator.acquire_lock(path)
+        try:
+            if os.path.exists(path):
+                async with aiofiles.open(path, "rb") as f:
+                    return await f.read()
+            return None
+        finally:
+            file_coordinator.release_lock(path)
 
 # === Logging Configuration ===
 LOG_LEVELS = {
@@ -75,7 +159,7 @@ STREAM_URL = os.environ.get(
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 SEGMENT_DURATION = int(os.environ.get("SEGMENT_DURATION", "10"))
-WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "6"))
+WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "12"))
 DEBUG_MESSAGES = os.environ.get("DEBUG_MESSAGES", "false").lower() == "true"
 
 # Constants for multimedia buffer initialization
@@ -609,7 +693,8 @@ async def create_master_playlist():
         os.makedirs(subtitle_dir, exist_ok=True)
     
     # Build the master playlist content
-    content = "#EXTM3U\n#EXT-X-VERSION:3\n\n"
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    content += "#EXT-X-INDEPENDENT-SEGMENTS\n\n"  # Add independent segments directive
     content += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n'
     
     # Add subtitle tracks
@@ -618,15 +703,14 @@ async def create_master_playlist():
         default = "YES" if lang == "ru" else "NO"
         content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8"\n'
     
-    # Add stream info with subtitles
-    content += '\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2",AUDIO="audio",SUBTITLES="subs"\n'
+    # Add stream info with subtitles and WebVTT codec
+    content += '\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2,wvtt",AUDIO="audio",SUBTITLES="subs"\n'
     content += 'video/playlist.m3u8\n'
     
-    # Write master playlist
-    async with aiofiles.open(master_playlist_path, "w") as f:
-        await f.write(content)
+    # Write master playlist with retries
+    await atomic_file_write_with_retry(master_playlist_path, content)
     
-    system_logger.info("Created master playlist with subtitle tracks")
+    system_logger.info("Created master playlist with subtitle tracks and WebVTT codec")
 
 async def create_vtt_segment(segment_number, language="ru"):
     """Create a WebVTT segment file for the given segment number and language."""
@@ -681,10 +765,9 @@ async def create_vtt_segment(segment_number, language="ru"):
                 transcription_logger.error(f"Error processing cue: {e}")
                 continue
         
-        # Write the segment file
+        # Write the segment file atomically
         segment_path = os.path.join(SUBTITLE_BASE_DIR, language, f"segment{segment_number}.vtt")
-        async with aiofiles.open(segment_path, "w", encoding="utf-8") as f:
-            await f.write(content)
+        await atomic_file_write_with_retry(segment_path, content)
             
         transcription_logger.debug(f"Created {language} segment {segment_number} with {cue_index-1} cues")
         return True
@@ -719,6 +802,7 @@ async def update_subtitle_playlist(language="ru"):
 
     # Create matching subtitle playlist with EXACTLY the same segments as video
     content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    content += "#EXT-X-INDEPENDENT-SEGMENTS\n"  # Add independent segments directive
     content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
     content += f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"
 
@@ -727,11 +811,10 @@ async def update_subtitle_playlist(language="ru"):
         content += f"#EXTINF:{SEGMENT_DURATION}.0,\n"
         content += f"segment{seg_num}.vtt\n"
 
-    async with aiofiles.open(playlist_path, "w", encoding="utf-8") as f:
-        await f.write(content)
+    # Write playlist atomically with retries
+    await atomic_file_write_with_retry(playlist_path, content)
     
-    if DEBUG_MESSAGES:
-        system_logger.info(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
+    system_logger.debug(f"Updated {language} subtitle playlist (media_sequence: {media_sequence}, segments: {segments})")
 
 async def monitor_segments_and_create_vtt():
     """
@@ -892,16 +975,30 @@ async def serve_file(file_path: str):
     if not os.path.exists(full_path):
         return PlainTextResponse(content="File not found", status_code=404)
     
-    # Determine content type based on file extension
+    # Special handling for VTT files to ensure proper UTF-8 encoding and atomic reading
+    if file_path.endswith(".vtt"):
+        content = await safe_read_file(full_path)
+        if content is None:
+            return PlainTextResponse(content="File not found", status_code=404)
+            
+        return Response(
+            content=content,
+            media_type="text/vtt; charset=utf-8",
+            headers={
+                "Content-Length": str(len(content)),
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+    
+    # Handle other file types normally
     content_type = "application/octet-stream"
     if file_path.endswith(".m3u8"):
         content_type = "application/vnd.apple.mpegurl"
     elif file_path.endswith(".ts"):
         content_type = "video/mp2t"
-    elif file_path.endswith(".vtt"):
-        content_type = "text/vtt"
     
-    # Add CORS and cache control headers
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -983,6 +1080,12 @@ async def generate_player_html():
             background: rgba(40,120,200,0.7);
             border-color: rgba(255,255,255,0.7);
         }
+        /* Enhance subtitle display */
+        ::cue {
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            font-size: 1.2em;
+        }
     </style>
 </head>
 <body>
@@ -1012,11 +1115,12 @@ async def generate_player_html():
                 this.hlsInstance = new Hls({
                     debug: false,
                     enableWebVTT: true,
+                    renderTextTracksNatively: true,
                     startLevel: -1,
                     defaultAudioCodec: 'mp4a.40.2',
                     maxBufferLength: 30,
                     maxMaxBufferLength: 600,
-                    startPosition: -1,
+                    startPosition: 0,
                     liveSyncDurationCount: 3,
                     liveMaxLatencyDurationCount: 10,
                     enableWorker: true,
@@ -1049,6 +1153,15 @@ async def generate_player_html():
                         });
                 });
                 
+                // Add debug events for subtitle tracking
+                this.hlsInstance.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_, data) => {
+                    console.log('Subtitle tracks updated:', data.subtitleTracks);
+                });
+                
+                this.hlsInstance.on(Hls.Events.SUBTITLE_TRACK_LOADED, (_, data) => {
+                    console.log('Subtitle track loaded:', data);
+                });
+                
                 this.hlsInstance.on(Hls.Events.ERROR, (event, data) => {
                     if (data.fatal) {
                         console.error(`Fatal error: ${data.type} - ${data.details}`);
@@ -1071,17 +1184,22 @@ async def generate_player_html():
                 if (!this.hlsInstance) return;
                 
                 const tracks = this.hlsInstance.subtitleTracks;
+                console.log('Available subtitle tracks:', tracks);
+                
                 const trackId = tracks.findIndex(track => track.lang === language);
                 
                 if (trackId !== -1) {
                     this.hlsInstance.subtitleTrack = trackId;
-                    console.log(`Selected ${language} subtitles`);
+                    console.log(`Selected ${language} subtitles (track ${trackId})`);
                     
                     document.querySelectorAll('.controls button').forEach(btn => {
                         btn.classList.remove('active');
                     });
                     document.getElementById(`btn-${language}`).classList.add('active');
-                },
+                } else {
+                    console.warn(`No subtitle track found for language: ${language}`);
+                }
+            },
             
             disableTextTrack() {
                 if (!this.hlsInstance) return;
