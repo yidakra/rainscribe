@@ -991,20 +991,17 @@ async def master_playlist():
 
 @app.get("/{file_path:path}")
 async def serve_file(file_path: str):
-    """Serve files from the serving directory."""
+    """Serve files ONLY from the serving directory."""
     global ready_to_serve
     
     # Restrict access to primary playlists until buffer initialization is complete
     if file_path in ["video/playlist.m3u8", "audio/playlist.m3u8"] and not ready_to_serve:
         return PlainTextResponse(content="Media buffer initialization in progress", status_code=404)
     
-    # Try serving from serving directory first
+    # Construct the full path within the serving directory
     full_path = os.path.join(SERVING_DIR, file_path)
     
-    # If not in serving directory and it's a segment file, try the main output directory
-    if not os.path.exists(full_path) and (file_path.endswith(".ts") or file_path.endswith(".vtt")):
-        full_path = os.path.join(HLS_OUTPUT_DIR, file_path)
-    
+    # Check if the file exists ONLY in the serving directory
     if not os.path.exists(full_path):
         return PlainTextResponse(content="File not found", status_code=404)
 
@@ -1323,10 +1320,54 @@ def handle_exit(*args):
     sys.exit(0)
 
 # === Drip-Feed Management ===
+async def ensure_serving_segment_files_exist(segment_number):
+    """Ensure video, audio, and VTT files for a segment exist in the serving directory."""
+    all_files_ready = True
+
+    # Define source and destination paths for media types
+    media_files_to_check = [
+        ("video", "ts"),
+        ("audio", "ts")
+    ]
+    for lang in caption_cues.keys():
+        media_files_to_check.append((f"subtitles/{lang}", "vtt"))
+
+    for media_type, extension in media_files_to_check:
+        source_path = os.path.join(HLS_OUTPUT_DIR, f"{media_type}/segment{segment_number}.{extension}")
+        link_path = os.path.join(SERVING_DIR, f"{media_type}/segment{segment_number}.{extension}")
+
+        # Create parent directory if needed
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+
+        if not os.path.exists(link_path):
+            if not os.path.exists(source_path):
+                system_logger.warning(f"Source file missing for segment {segment_number}: {source_path}")
+                all_files_ready = False
+                continue  # Skip this file, but check others
+            
+            # Create a hard link (copy) rather than symlink for simplicity
+            try:
+                await asyncio.to_thread(os.link, source_path, link_path)
+                system_logger.debug(f"Created serving link for: {link_path}")
+            except OSError:
+                # If hard link fails (e.g., cross-device), just copy the file
+                try:
+                    import shutil
+                    await asyncio.to_thread(shutil.copy2, source_path, link_path)
+                    system_logger.debug(f"Copied serving file for: {link_path}")
+                except Exception as copy_err:
+                    system_logger.error(f"Failed to copy serving file {source_path} to {link_path}: {copy_err}")
+                    all_files_ready = False
+            except Exception as link_err:
+                system_logger.error(f"Failed to link serving file {source_path} to {link_path}: {link_err}")
+                all_files_ready = False
+    
+    return all_files_ready
+
 async def manage_drip_feed():
     """
-    Manages the drip-feed of segments from buffer to serving playlists,
-    maintaining a constant 60-second delay behind the source stream.
+    Manage the drip-feed of segments to maintain a constant delay behind the source stream.
+    Ensures segment files exist in serving dir before updating playlists.
     """
     global ready_to_serve, delayed_start_time, serving_media_sequence, serving_segments, processed_segments
     
@@ -1344,7 +1385,17 @@ async def manage_drip_feed():
     serving_segments["audio"] = [first_serving_segment]
     for lang in caption_cues.keys():
         serving_segments["subtitles"][lang] = [first_serving_segment]
-    
+
+    # --- Fix Start: Ensure first segment files exist before initial playlist write ---
+    initial_files_ready = False
+    while not initial_files_ready:
+        initial_files_ready = await ensure_serving_segment_files_exist(first_serving_segment)
+        if not initial_files_ready:
+            system_logger.warning(f"Initial serving files for segment {first_serving_segment} not ready, waiting...")
+            await asyncio.sleep(0.5)
+    system_logger.info(f"Initial serving files for segment {first_serving_segment} confirmed.")
+    # --- Fix End ---
+
     # Create initial serving playlists
     await create_serving_master_playlist()
     await update_serving_media_playlists()
@@ -1367,27 +1418,52 @@ async def manage_drip_feed():
             # Time to add the next segment
             next_segment = first_serving_segment + next_segment_index
             
-            # Check if this segment exists and has subtitles
-            video_segment_path = os.path.join(VIDEO_DIR, f"segment{next_segment}.ts") 
-            if not os.path.exists(video_segment_path):
-                system_logger.warning(f"Segment {next_segment} not ready, waiting...")
-                await asyncio.sleep(0.5)
-                continue
+            # --- Modification Start ---
+            # Ensure all source files for this segment exist
+            # We primarily check video, but the helper will check others.
+            video_source_path = os.path.join(VIDEO_DIR, f"segment{next_segment}.ts")
+            audio_source_path = os.path.join(AUDIO_DIR, f"segment{next_segment}.ts")
+            # We don't explicitly check VTT source here, as it might lag. 
+            # ensure_serving_segment_files_exist will handle missing VTT source gracefully.
+            if not os.path.exists(video_source_path) or not os.path.exists(audio_source_path):
+                system_logger.warning(f"Core media segment {next_segment} source not ready, waiting...")
+                await asyncio.sleep(0.5) 
+                continue # Wait for the core media segment to exist first
+
+            # Ensure serving files are created *before* updating lists/playlists
+            files_ready = await ensure_serving_segment_files_exist(next_segment)
+            if not files_ready:
+                system_logger.warning(f"Serving files for segment {next_segment} not ready yet, retrying...")
+                await asyncio.sleep(0.2) # Short sleep before retrying file creation
+                continue # Re-check files on next loop iteration
+            # --- Modification End ---
                 
             # Update serving segments lists - maintain SERVING_WINDOW_SIZE
-            for media_type in ["video", "audio"]:
-                serving_segments[media_type].append(next_segment)
-                if len(serving_segments[media_type]) > SERVING_WINDOW_SIZE:
-                    serving_segments[media_type].pop(0)
-                    serving_media_sequence += 1
-            
-            # Update subtitle segments
+            # Add the new segment to all relevant lists first
+            serving_segments["video"].append(next_segment)
+            serving_segments["audio"].append(next_segment)
             for lang in caption_cues.keys():
                 serving_segments["subtitles"][lang].append(next_segment)
-                if len(serving_segments["subtitles"][lang]) > SERVING_WINDOW_SIZE:
-                    serving_segments["subtitles"][lang].pop(0)
+
+            # --- Fix Start: Correct sequence number increment and segment popping ---
+            increment_sequence = False
+            # Check if window size exceeded based on video list
+            if len(serving_segments["video"]) > SERVING_WINDOW_SIZE:
+                increment_sequence = True
+                serving_media_sequence += 1 # Increment sequence only ONCE
+                system_logger.debug(f"Incremented serving sequence to {serving_media_sequence}")
             
-            # Update all serving playlists
+            # Pop old segments from all lists if window was exceeded
+            if increment_sequence:
+                for media_type in ["video", "audio"]:
+                    removed_segment = serving_segments[media_type].pop(0)
+                    system_logger.debug(f"Popped segment {removed_segment} from {media_type} serving list.")
+                for lang in caption_cues.keys():
+                    removed_segment = serving_segments["subtitles"][lang].pop(0)
+                    system_logger.debug(f"Popped segment {removed_segment} from subtitles/{lang} serving list.")
+            # --- Fix End ---
+            
+            # Update all serving playlists (now with consistent sequence number)
             await update_serving_media_playlists()
             
             system_logger.info(f"Added segment {next_segment} to serving playlists (sequence: {serving_media_sequence})")
@@ -1454,28 +1530,12 @@ async def update_serving_playlist(media_type, extension):
     content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
     content += f"#EXT-X-MEDIA-SEQUENCE:{serving_media_sequence}\n"
     
-    # Add each segment
+    # Add each segment (files are assumed to exist in serving dir now)
     for seg_num in segments:
         content += f"#EXTINF:{SEGMENT_DURATION}.0,\n"
-        
-        # For serving playlists, we use symbolic links to the original segments
         content += f"segment{seg_num}.{extension}\n"
-        
-        # Ensure symbolic link exists (create it if not)
-        source_path = os.path.join(HLS_OUTPUT_DIR, f"{media_type}/segment{seg_num}.{extension}")
-        link_path = os.path.join(SERVING_DIR, f"{media_type}/segment{seg_num}.{extension}")
-        
-        # Create parent directory if needed
-        os.makedirs(os.path.dirname(link_path), exist_ok=True)
-        
-        # Create a hard link (copy) rather than symlink for simplicity
-        if not os.path.exists(link_path) and os.path.exists(source_path):
-            try:
-                await asyncio.to_thread(os.link, source_path, link_path)
-            except OSError:
-                # If hard link fails (e.g., cross-device), just copy the file
-                import shutil
-                await asyncio.to_thread(shutil.copy2, source_path, link_path)
+    
+    # Removed file linking/copying logic from here
     
     await atomic_file_write_with_retry(playlist_path, content)
 
