@@ -174,7 +174,7 @@ AUDIO_DIR = os.path.join(HLS_OUTPUT_DIR, "audio")
 SUBTITLE_BASE_DIR = os.path.join(HLS_OUTPUT_DIR, "subtitles")
 
 # Serving configuration
-SERVING_WINDOW_SIZE = 2  # Number of segments in serving playlist
+SERVING_WINDOW_SIZE = 4  # Number of segments in serving playlist (set to 4 for testing)
 SERVING_DIR = os.path.join(HLS_OUTPUT_DIR, "serving")
 SERVING_VIDEO_DIR = os.path.join(SERVING_DIR, "video")
 SERVING_AUDIO_DIR = os.path.join(SERVING_DIR, "audio")
@@ -208,6 +208,9 @@ serving_segments = {
 }
 serving_media_sequence = 0  # Current media sequence for serving playlists
 delayed_start_time = None   # When we started serving (60s after script start)
+
+# Global variables
+processed_segments = set()  # Moved to global scope
 
 # === Streaming Configuration for Gladia ===
 STREAMING_CONFIGURATION = {
@@ -305,7 +308,7 @@ def cleanup_old_directories():
     """Clean up old output directories to start fresh."""
     try:
         import shutil
-        for dir_path in [VIDEO_DIR, AUDIO_DIR, SUBTITLE_BASE_DIR]:
+        for dir_path in [VIDEO_DIR, AUDIO_DIR, SUBTITLE_BASE_DIR, SERVING_DIR]:
             if os.path.exists(dir_path):
                 shutil.rmtree(dir_path)
                 system_logger.info(f"Cleaned up directory: {dir_path}")
@@ -847,9 +850,8 @@ async def monitor_segments_and_create_vtt():
     Monitor video segments and create corresponding VTT segments.
     This ensures subtitle segments are created for every video segment.
     """
-    global first_segment_timestamp, ready_to_serve, segment_time_offset
+    global first_segment_timestamp, ready_to_serve, segment_time_offset, processed_segments
     
-    processed_segments = set()
     retry_count = 0
     max_retries = 10
     
@@ -1005,31 +1007,8 @@ async def serve_file(file_path: str):
     
     if not os.path.exists(full_path):
         return PlainTextResponse(content="File not found", status_code=404)
-    
-    # Special handling for VTT files to ensure proper UTF-8 encoding and atomic reading
-    if file_path.endswith(".vtt"):
-        content = await safe_read_file(full_path)
-        if content is None:
-            return PlainTextResponse(content="File not found", status_code=404)
-            
-        return Response(
-            content=content,
-            media_type="text/vtt; charset=utf-8",
-            headers={
-                "Content-Length": str(len(content)),
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Cache-Control": "no-cache, no-store, must-revalidate"
-            }
-        )
-    
-    # Handle other file types normally
-    content_type = "application/octet-stream"
-    if file_path.endswith(".m3u8"):
-        content_type = "application/vnd.apple.mpegurl"
-    elif file_path.endswith(".ts"):
-        content_type = "video/mp2t"
-    
+
+    # Set common headers
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -1037,7 +1016,17 @@ async def serve_file(file_path: str):
         "Pragma": "no-cache",
         "Expires": "0"
     }
-    
+
+    # Determine media type
+    content_type = "application/octet-stream" # Default
+    if file_path.endswith(".vtt"):
+        content_type = "text/vtt; charset=utf-8"
+    elif file_path.endswith(".m3u8"):
+        content_type = "application/vnd.apple.mpegurl"
+    elif file_path.endswith(".ts"):
+        content_type = "video/mp2t"
+
+    # Serve using FileResponse for robustness
     return FileResponse(
         path=full_path,
         media_type=content_type,
@@ -1339,7 +1328,7 @@ async def manage_drip_feed():
     Manages the drip-feed of segments from buffer to serving playlists,
     maintaining a constant 60-second delay behind the source stream.
     """
-    global ready_to_serve, delayed_start_time, serving_media_sequence, serving_segments
+    global ready_to_serve, delayed_start_time, serving_media_sequence, serving_segments, processed_segments
     
     # Wait until buffer initialization is complete
     while not (len(processed_segments) >= REQUIRED_BUFFER_SEGMENTS and initialization_complete):
