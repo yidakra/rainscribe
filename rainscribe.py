@@ -173,6 +173,13 @@ VIDEO_DIR = os.path.join(HLS_OUTPUT_DIR, "video")
 AUDIO_DIR = os.path.join(HLS_OUTPUT_DIR, "audio")
 SUBTITLE_BASE_DIR = os.path.join(HLS_OUTPUT_DIR, "subtitles")
 
+# Serving configuration
+SERVING_WINDOW_SIZE = 2  # Number of segments in serving playlist
+SERVING_DIR = os.path.join(HLS_OUTPUT_DIR, "serving")
+SERVING_VIDEO_DIR = os.path.join(SERVING_DIR, "video")
+SERVING_AUDIO_DIR = os.path.join(SERVING_DIR, "audio")
+SERVING_SUBTITLE_BASE_DIR = os.path.join(SERVING_DIR, "subtitles")
+
 # === Global State Management ===
 # Caption storage with controlled memory usage (prevents memory leaks for 24/7 operation)
 MAX_CUES_PER_LANGUAGE = 1000
@@ -192,6 +199,15 @@ segment_time_offset = None
 # Synchronization status
 ready_to_serve = False
 initialization_complete = False
+
+# Serving state
+serving_segments = {
+    "video": [],
+    "audio": [],
+    "subtitles": {"ru": [], "en": [], "nl": []}
+}
+serving_media_sequence = 0  # Current media sequence for serving playlists
+delayed_start_time = None   # When we started serving (60s after script start)
 
 # === Streaming Configuration for Gladia ===
 STREAMING_CONFIGURATION = {
@@ -298,12 +314,19 @@ def cleanup_old_directories():
 
 def ensure_directories_exist():
     """Ensure all required directories exist."""
+    # Create main directories
     for dir_path in [VIDEO_DIR, AUDIO_DIR]:
         os.makedirs(dir_path, exist_ok=True)
     
     # Create subtitle directories for each language
     for lang in caption_cues.keys():
         os.makedirs(os.path.join(SUBTITLE_BASE_DIR, lang), exist_ok=True)
+    
+    # Create serving directories
+    os.makedirs(SERVING_VIDEO_DIR, exist_ok=True)
+    os.makedirs(SERVING_AUDIO_DIR, exist_ok=True)
+    for lang in caption_cues.keys():
+        os.makedirs(os.path.join(SERVING_SUBTITLE_BASE_DIR, lang), exist_ok=True)
 
 # === Transcription Processing ===
 async def stream_audio_to_gladia(websocket: WebSocketClientProtocol) -> None:
@@ -616,7 +639,7 @@ async def create_hls_stream():
         "-f", "hls",
         "-hls_time", str(SEGMENT_DURATION),
         "-hls_list_size", str(WINDOW_SIZE),
-        "-hls_flags", "delete_segments+independent_segments+program_date_time",
+        "-hls_flags", "delete_segments+independent_segments+append_list+split_by_time",
         "-hls_segment_type", "mpegts",
         "-hls_allow_cache", "0",
         "-hls_start_number_source", "epoch",
@@ -628,7 +651,7 @@ async def create_hls_stream():
         "-f", "hls",
         "-hls_time", str(SEGMENT_DURATION),
         "-hls_list_size", str(WINDOW_SIZE),
-        "-hls_flags", "delete_segments+independent_segments+program_date_time",
+        "-hls_flags", "delete_segments+independent_segments+append_list+split_by_time",
         "-hls_segment_type", "mpegts",
         "-hls_allow_cache", "0",
         "-hls_start_number_source", "epoch",
@@ -694,16 +717,19 @@ async def create_master_playlist():
     
     # Build the master playlist content
     content = "#EXTM3U\n#EXT-X-VERSION:3\n"
-    content += "#EXT-X-INDEPENDENT-SEGMENTS\n\n"  # Add independent segments directive
-    content += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n'
+    content += "#EXT-X-INDEPENDENT-SEGMENTS\n"
     
-    # Add subtitle tracks
+    # Audio track
+    content += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n\n'
+    
+    # Subtitle tracks with explicit MIME type
     lang_names = {"ru": "Russian", "en": "English", "nl": "Dutch"}
     for lang, name in lang_names.items():
         default = "YES" if lang == "ru" else "NO"
-        content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8"\n'
+        content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,' + \
+                  f'FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8",CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog"\n'
     
-    # Add stream info with subtitles and WebVTT codec
+    # Add stream info with explicit subtitle codecs
     content += '\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2,wvtt",AUDIO="audio",SUBTITLES="subs"\n'
     content += 'video/playlist.m3u8\n'
     
@@ -939,14 +965,13 @@ async def player_page():
 
 @app.get("/master.m3u8")
 async def master_playlist():
-    """Serve the master playlist. Returns 404 until buffer initialization is complete."""
+    """Serve the master playlist from the serving directory."""
     global ready_to_serve
     
-    # Restrict content delivery until buffer initialization criteria are satisfied
     if not ready_to_serve:
         return PlainTextResponse(content="Media buffer initialization in progress", status_code=404)
     
-    file_path = os.path.join(HLS_OUTPUT_DIR, "master.m3u8")
+    file_path = os.path.join(SERVING_DIR, "master.m3u8")
     if not os.path.exists(file_path):
         return PlainTextResponse(content="Playlist not found", status_code=404)
         
@@ -964,14 +989,20 @@ async def master_playlist():
 
 @app.get("/{file_path:path}")
 async def serve_file(file_path: str):
-    """Serve files from the output directory according to buffer initialization status."""
+    """Serve files from the serving directory."""
     global ready_to_serve
     
     # Restrict access to primary playlists until buffer initialization is complete
     if file_path in ["video/playlist.m3u8", "audio/playlist.m3u8"] and not ready_to_serve:
         return PlainTextResponse(content="Media buffer initialization in progress", status_code=404)
     
-    full_path = os.path.join(HLS_OUTPUT_DIR, file_path)
+    # Try serving from serving directory first
+    full_path = os.path.join(SERVING_DIR, file_path)
+    
+    # If not in serving directory and it's a segment file, try the main output directory
+    if not os.path.exists(full_path) and (file_path.endswith(".ts") or file_path.endswith(".vtt")):
+        full_path = os.path.join(HLS_OUTPUT_DIR, file_path)
+    
     if not os.path.exists(full_path):
         return PlainTextResponse(content="File not found", status_code=404)
     
@@ -1268,7 +1299,8 @@ async def transcription_main():
                 hls_task,
                 asyncio.create_task(process_transcription_messages(websocket)),
                 asyncio.create_task(stream_audio_to_gladia(websocket)),
-                asyncio.create_task(monitor_segments_and_create_vtt())
+                asyncio.create_task(monitor_segments_and_create_vtt()),
+                asyncio.create_task(manage_drip_feed())  # Add drip-feed task
             ]
             
             # Wait for any task to complete (which shouldn't happen unless there's an error)
@@ -1300,6 +1332,163 @@ def handle_exit(*args):
             process.terminate()
             system_logger.info(f"Terminated {name} process")
     sys.exit(0)
+
+# === Drip-Feed Management ===
+async def manage_drip_feed():
+    """
+    Manages the drip-feed of segments from buffer to serving playlists,
+    maintaining a constant 60-second delay behind the source stream.
+    """
+    global ready_to_serve, delayed_start_time, serving_media_sequence, serving_segments
+    
+    # Wait until buffer initialization is complete
+    while not (len(processed_segments) >= REQUIRED_BUFFER_SEGMENTS and initialization_complete):
+        await asyncio.sleep(1)
+    
+    # Track the first segment we'll serve
+    first_serving_segment = min(processed_segments)
+    delayed_start_time = time.time()
+    system_logger.info(f"Starting drip-feed with first segment: {first_serving_segment}")
+    
+    # Initialize serving segment with the first segment
+    serving_segments["video"] = [first_serving_segment]
+    serving_segments["audio"] = [first_serving_segment]
+    for lang in caption_cues.keys():
+        serving_segments["subtitles"][lang] = [first_serving_segment]
+    
+    # Create initial serving playlists
+    await create_serving_master_playlist()
+    await update_serving_media_playlists()
+    
+    # Signal that we're ready to serve
+    ready_to_serve = True
+    
+    # Drip-feed loop - add a new segment every SEGMENT_DURATION seconds
+    next_segment_time = delayed_start_time + SEGMENT_DURATION
+    next_segment_index = 1  # Index relative to first_serving_segment
+    
+    while True:
+        try:
+            # Wait until it's time for the next segment
+            now = time.time()
+            if now < next_segment_time:
+                await asyncio.sleep(0.1)
+                continue
+            
+            # Time to add the next segment
+            next_segment = first_serving_segment + next_segment_index
+            
+            # Check if this segment exists and has subtitles
+            video_segment_path = os.path.join(VIDEO_DIR, f"segment{next_segment}.ts") 
+            if not os.path.exists(video_segment_path):
+                system_logger.warning(f"Segment {next_segment} not ready, waiting...")
+                await asyncio.sleep(0.5)
+                continue
+                
+            # Update serving segments lists - maintain SERVING_WINDOW_SIZE
+            for media_type in ["video", "audio"]:
+                serving_segments[media_type].append(next_segment)
+                if len(serving_segments[media_type]) > SERVING_WINDOW_SIZE:
+                    serving_segments[media_type].pop(0)
+                    serving_media_sequence += 1
+            
+            # Update subtitle segments
+            for lang in caption_cues.keys():
+                serving_segments["subtitles"][lang].append(next_segment)
+                if len(serving_segments["subtitles"][lang]) > SERVING_WINDOW_SIZE:
+                    serving_segments["subtitles"][lang].pop(0)
+            
+            # Update all serving playlists
+            await update_serving_media_playlists()
+            
+            system_logger.info(f"Added segment {next_segment} to serving playlists (sequence: {serving_media_sequence})")
+            
+            # Schedule next segment
+            next_segment_time += SEGMENT_DURATION
+            next_segment_index += 1
+            
+        except Exception as e:
+            system_logger.error(f"Error in drip feed: {e}")
+            await asyncio.sleep(1)
+
+async def create_serving_master_playlist():
+    """Create a master playlist for the serving stream."""
+    master_playlist_path = os.path.join(SERVING_DIR, "master.m3u8")
+    
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    content += "#EXT-X-INDEPENDENT-SEGMENTS\n\n"
+    
+    # Audio track
+    content += f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"\n\n'
+    
+    # Subtitle tracks
+    lang_names = {"ru": "Russian", "en": "English", "nl": "Dutch"}
+    for lang, name in lang_names.items():
+        default = "YES" if lang == "ru" else "NO"
+        content += f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",DEFAULT={default},AUTOSELECT=YES,' + \
+                  f'FORCED=NO,LANGUAGE="{lang}",URI="subtitles/{lang}/playlist.m3u8",CHARACTERISTICS="public.accessibility.transcribes-spoken-dialog"\n'
+    
+    # Add stream info
+    content += f'\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS="avc1.64001f,mp4a.40.2,wvtt",AUDIO="audio",SUBTITLES="subs"\n'
+    content += 'video/playlist.m3u8\n'
+    
+    await atomic_file_write_with_retry(master_playlist_path, content)
+    system_logger.info("Created serving master playlist")
+
+async def update_serving_media_playlists():
+    """Update all serving playlists (video, audio, subtitles)."""
+    # Update video playlist
+    await update_serving_playlist("video", "ts")
+    
+    # Update audio playlist
+    await update_serving_playlist("audio", "ts")
+    
+    # Update subtitle playlists
+    for lang in caption_cues.keys():
+        await update_serving_playlist(f"subtitles/{lang}", "vtt")
+
+async def update_serving_playlist(media_type, extension):
+    """Update a specific serving playlist."""
+    if "/" in media_type:
+        # Handle subtitle directories
+        playlist_path = os.path.join(SERVING_DIR, f"{media_type}/playlist.m3u8")
+        segment_key = "subtitles/" + media_type.split("/")[1]
+        segments = serving_segments["subtitles"][media_type.split("/")[1]]
+    else:
+        playlist_path = os.path.join(SERVING_DIR, f"{media_type}/playlist.m3u8")
+        segment_key = media_type
+        segments = serving_segments[media_type]
+    
+    # Create playlist content
+    content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+    content += "#EXT-X-INDEPENDENT-SEGMENTS\n"
+    content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
+    content += f"#EXT-X-MEDIA-SEQUENCE:{serving_media_sequence}\n"
+    
+    # Add each segment
+    for seg_num in segments:
+        content += f"#EXTINF:{SEGMENT_DURATION}.0,\n"
+        
+        # For serving playlists, we use symbolic links to the original segments
+        content += f"segment{seg_num}.{extension}\n"
+        
+        # Ensure symbolic link exists (create it if not)
+        source_path = os.path.join(HLS_OUTPUT_DIR, f"{media_type}/segment{seg_num}.{extension}")
+        link_path = os.path.join(SERVING_DIR, f"{media_type}/segment{seg_num}.{extension}")
+        
+        # Create parent directory if needed
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        
+        # Create a hard link (copy) rather than symlink for simplicity
+        if not os.path.exists(link_path) and os.path.exists(source_path):
+            try:
+                await asyncio.to_thread(os.link, source_path, link_path)
+            except OSError:
+                # If hard link fails (e.g., cross-device), just copy the file
+                import shutil
+                await asyncio.to_thread(shutil.copy2, source_path, link_path)
+    
+    await atomic_file_write_with_retry(playlist_path, content)
 
 if __name__ == "__main__":
     # Register signal handlers
