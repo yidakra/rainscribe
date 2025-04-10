@@ -200,17 +200,51 @@ segment_time_offset = None
 ready_to_serve = False
 initialization_complete = False
 
-# Serving state
-serving_segments = {
-    "video": [],
-    "audio": [],
-    "subtitles": {"ru": [], "en": [], "nl": []}
-}
-serving_media_sequence = 0  # Current media sequence for serving playlists
-delayed_start_time = None   # When we started serving (60s after script start)
-
 # Global variables
 processed_segments = set()  # Moved to global scope
+
+# === Serving State Management ===
+class ServingState:
+    """Manages the state of segments being served to clients."""
+    def __init__(self):
+        self._segments = deque(maxlen=SERVING_WINDOW_SIZE)  # Single source of truth for segment numbers
+        self._media_sequence = 0
+        self._lock = asyncio.Lock()  # For thread-safe operations
+        
+    @property
+    def segments(self):
+        """Get current list of segments."""
+        return list(self._segments)
+    
+    @property
+    def media_sequence(self):
+        """Get current media sequence number."""
+        return self._media_sequence
+    
+    async def add_segment(self, segment_number):
+        """Add a new segment and handle window sliding."""
+        async with self._lock:
+            self._segments.append(segment_number)
+            if len(self._segments) > SERVING_WINDOW_SIZE:
+                self._segments.popleft()  # Remove oldest segment
+                self._media_sequence += 1  # Increment sequence number
+                return True  # Indicates sequence was incremented
+            return False
+    
+    def is_empty(self):
+        """Check if there are any segments."""
+        return len(self._segments) == 0
+    
+    def get_oldest_segment(self):
+        """Get the oldest segment number."""
+        return self._segments[0] if not self.is_empty() else None
+    
+    def get_newest_segment(self):
+        """Get the newest segment number."""
+        return self._segments[-1] if not self.is_empty() else None
+
+# Create global serving state instance
+serving_state = ServingState()
 
 # === Streaming Configuration for Gladia ===
 STREAMING_CONFIGURATION = {
@@ -1323,34 +1357,39 @@ def handle_exit(*args):
 async def ensure_serving_segment_files_exist(segment_number):
     """Ensure video, audio, and VTT files for a segment exist in the serving directory."""
     all_files_ready = True
+    files_to_check = []
 
-    # Define source and destination paths for media types
-    media_files_to_check = [
-        ("video", "ts"),
-        ("audio", "ts")
-    ]
+    # Build list of all required files first
+    files_to_check.extend([
+        (os.path.join(VIDEO_DIR, f"segment{segment_number}.ts"),
+         os.path.join(SERVING_VIDEO_DIR, f"segment{segment_number}.ts")),
+        (os.path.join(AUDIO_DIR, f"segment{segment_number}.ts"),
+         os.path.join(SERVING_AUDIO_DIR, f"segment{segment_number}.ts"))
+    ])
+    
+    # Add VTT files for each language
     for lang in caption_cues.keys():
-        media_files_to_check.append((f"subtitles/{lang}", "vtt"))
+        files_to_check.append((
+            os.path.join(SUBTITLE_BASE_DIR, lang, f"segment{segment_number}.vtt"),
+            os.path.join(SERVING_SUBTITLE_BASE_DIR, lang, f"segment{segment_number}.vtt")
+        ))
 
-    for media_type, extension in media_files_to_check:
-        source_path = os.path.join(HLS_OUTPUT_DIR, f"{media_type}/segment{segment_number}.{extension}")
-        link_path = os.path.join(SERVING_DIR, f"{media_type}/segment{segment_number}.{extension}")
+    # Check all source files exist first
+    for source_path, _ in files_to_check:
+        if not os.path.exists(source_path):
+            system_logger.warning(f"Source file missing: {source_path}")
+            return False
 
+    # If all source files exist, ensure they're in serving directory
+    for source_path, link_path in files_to_check:
         # Create parent directory if needed
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
 
         if not os.path.exists(link_path):
-            if not os.path.exists(source_path):
-                system_logger.warning(f"Source file missing for segment {segment_number}: {source_path}")
-                all_files_ready = False
-                continue  # Skip this file, but check others
-            
-            # Create a hard link (copy) rather than symlink for simplicity
             try:
                 await asyncio.to_thread(os.link, source_path, link_path)
                 system_logger.debug(f"Created serving link for: {link_path}")
             except OSError:
-                # If hard link fails (e.g., cross-device), just copy the file
                 try:
                     import shutil
                     await asyncio.to_thread(shutil.copy2, source_path, link_path)
@@ -1361,15 +1400,15 @@ async def ensure_serving_segment_files_exist(segment_number):
             except Exception as link_err:
                 system_logger.error(f"Failed to link serving file {source_path} to {link_path}: {link_err}")
                 all_files_ready = False
-    
+
     return all_files_ready
 
 async def manage_drip_feed():
     """
     Manage the drip-feed of segments to maintain a constant delay behind the source stream.
-    Ensures segment files exist in serving dir before updating playlists.
+    Uses ServingState for synchronized segment management.
     """
-    global ready_to_serve, delayed_start_time, serving_media_sequence, serving_segments, processed_segments
+    global ready_to_serve, delayed_start_time
     
     # Wait until buffer initialization is complete
     while not (len(processed_segments) >= REQUIRED_BUFFER_SEGMENTS and initialization_complete):
@@ -1380,32 +1419,27 @@ async def manage_drip_feed():
     delayed_start_time = time.time()
     system_logger.info(f"Starting drip-feed with first segment: {first_serving_segment}")
     
-    # Initialize serving segment with the first segment
-    serving_segments["video"] = [first_serving_segment]
-    serving_segments["audio"] = [first_serving_segment]
-    for lang in caption_cues.keys():
-        serving_segments["subtitles"][lang] = [first_serving_segment]
-
-    # --- Fix Start: Ensure first segment files exist before initial playlist write ---
+    # Ensure first segment files exist before starting
     initial_files_ready = False
     while not initial_files_ready:
         initial_files_ready = await ensure_serving_segment_files_exist(first_serving_segment)
         if not initial_files_ready:
             system_logger.warning(f"Initial serving files for segment {first_serving_segment} not ready, waiting...")
             await asyncio.sleep(0.5)
-    system_logger.info(f"Initial serving files for segment {first_serving_segment} confirmed.")
-    # --- Fix End ---
-
-    # Create initial serving playlists
+    
+    # Add first segment to serving state
+    await serving_state.add_segment(first_serving_segment)
+    
+    # Create initial playlists
     await create_serving_master_playlist()
     await update_serving_media_playlists()
     
     # Signal that we're ready to serve
     ready_to_serve = True
     
-    # Drip-feed loop - add a new segment every SEGMENT_DURATION seconds
+    # Drip-feed loop
     next_segment_time = delayed_start_time + SEGMENT_DURATION
-    next_segment_index = 1  # Index relative to first_serving_segment
+    next_segment_index = 1
     
     while True:
         try:
@@ -1415,58 +1449,27 @@ async def manage_drip_feed():
                 await asyncio.sleep(0.1)
                 continue
             
-            # Time to add the next segment
+            # Calculate next segment number
             next_segment = first_serving_segment + next_segment_index
             
-            # --- Modification Start ---
-            # Ensure all source files for this segment exist
-            # We primarily check video, but the helper will check others.
-            video_source_path = os.path.join(VIDEO_DIR, f"segment{next_segment}.ts")
-            audio_source_path = os.path.join(AUDIO_DIR, f"segment{next_segment}.ts")
-            # We don't explicitly check VTT source here, as it might lag. 
-            # ensure_serving_segment_files_exist will handle missing VTT source gracefully.
-            if not os.path.exists(video_source_path) or not os.path.exists(audio_source_path):
-                system_logger.warning(f"Core media segment {next_segment} source not ready, waiting...")
-                await asyncio.sleep(0.5) 
-                continue # Wait for the core media segment to exist first
-
-            # Ensure serving files are created *before* updating lists/playlists
+            # Ensure all files exist before proceeding
             files_ready = await ensure_serving_segment_files_exist(next_segment)
             if not files_ready:
-                system_logger.warning(f"Serving files for segment {next_segment} not ready yet, retrying...")
-                await asyncio.sleep(0.2) # Short sleep before retrying file creation
-                continue # Re-check files on next loop iteration
-            # --- Modification End ---
-                
-            # Update serving segments lists - maintain SERVING_WINDOW_SIZE
-            # Add the new segment to all relevant lists first
-            serving_segments["video"].append(next_segment)
-            serving_segments["audio"].append(next_segment)
-            for lang in caption_cues.keys():
-                serving_segments["subtitles"][lang].append(next_segment)
-
-            # --- Fix Start: Correct sequence number increment and segment popping ---
-            increment_sequence = False
-            # Check if window size exceeded based on video list
-            if len(serving_segments["video"]) > SERVING_WINDOW_SIZE:
-                increment_sequence = True
-                serving_media_sequence += 1 # Increment sequence only ONCE
-                system_logger.debug(f"Incremented serving sequence to {serving_media_sequence}")
+                system_logger.warning(f"Files for segment {next_segment} not ready, retrying...")
+                await asyncio.sleep(0.2)
+                continue
             
-            # Pop old segments from all lists if window was exceeded
-            if increment_sequence:
-                for media_type in ["video", "audio"]:
-                    removed_segment = serving_segments[media_type].pop(0)
-                    system_logger.debug(f"Popped segment {removed_segment} from {media_type} serving list.")
-                for lang in caption_cues.keys():
-                    removed_segment = serving_segments["subtitles"][lang].pop(0)
-                    system_logger.debug(f"Popped segment {removed_segment} from subtitles/{lang} serving list.")
-            # --- Fix End ---
+            # Add segment to serving state
+            sequence_incremented = await serving_state.add_segment(next_segment)
             
-            # Update all serving playlists (now with consistent sequence number)
+            # Update all playlists atomically
             await update_serving_media_playlists()
             
-            system_logger.info(f"Added segment {next_segment} to serving playlists (sequence: {serving_media_sequence})")
+            system_logger.info(
+                f"Added segment {next_segment} to serving playlists "
+                f"(sequence: {serving_state.media_sequence}, "
+                f"window: {serving_state.segments})"
+            )
             
             # Schedule next segment
             next_segment_time += SEGMENT_DURATION
@@ -1501,43 +1504,48 @@ async def create_serving_master_playlist():
     system_logger.info("Created serving master playlist")
 
 async def update_serving_media_playlists():
-    """Update all serving playlists (video, audio, subtitles)."""
-    # Update video playlist
-    await update_serving_playlist("video", "ts")
-    
-    # Update audio playlist
-    await update_serving_playlist("audio", "ts")
-    
-    # Update subtitle playlists
-    for lang in caption_cues.keys():
-        await update_serving_playlist(f"subtitles/{lang}", "vtt")
+    """Update all serving playlists atomically to ensure synchronization."""
+    try:
+        # Generate all playlist content first
+        playlists_content = {}
+        
+        # Video and audio playlists
+        for media_type in ["video", "audio"]:
+            extension = "ts"
+            playlist_path = os.path.join(SERVING_DIR, f"{media_type}/playlist.m3u8")
+            content = generate_playlist_content(media_type, extension)
+            playlists_content[playlist_path] = content
+        
+        # Subtitle playlists
+        for lang in caption_cues.keys():
+            playlist_path = os.path.join(SERVING_DIR, f"subtitles/{lang}/playlist.m3u8")
+            content = generate_playlist_content(f"subtitles/{lang}", "vtt")
+            playlists_content[playlist_path] = content
+        
+        # Write all playlists as close together as possible
+        write_tasks = []
+        for path, content in playlists_content.items():
+            task = atomic_file_write_with_retry(path, content)
+            write_tasks.append(task)
+        
+        await asyncio.gather(*write_tasks)
+        
+    except Exception as e:
+        system_logger.error(f"Error updating serving playlists: {e}")
+        raise
 
-async def update_serving_playlist(media_type, extension):
-    """Update a specific serving playlist."""
-    if "/" in media_type:
-        # Handle subtitle directories
-        playlist_path = os.path.join(SERVING_DIR, f"{media_type}/playlist.m3u8")
-        segment_key = "subtitles/" + media_type.split("/")[1]
-        segments = serving_segments["subtitles"][media_type.split("/")[1]]
-    else:
-        playlist_path = os.path.join(SERVING_DIR, f"{media_type}/playlist.m3u8")
-        segment_key = media_type
-        segments = serving_segments[media_type]
-    
-    # Create playlist content
+def generate_playlist_content(media_type, extension):
+    """Generate playlist content based on current serving state."""
     content = "#EXTM3U\n#EXT-X-VERSION:3\n"
     content += "#EXT-X-INDEPENDENT-SEGMENTS\n"
     content += f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}\n"
-    content += f"#EXT-X-MEDIA-SEQUENCE:{serving_media_sequence}\n"
+    content += f"#EXT-X-MEDIA-SEQUENCE:{serving_state.media_sequence}\n"
     
-    # Add each segment (files are assumed to exist in serving dir now)
-    for seg_num in segments:
+    for seg_num in serving_state.segments:
         content += f"#EXTINF:{SEGMENT_DURATION}.0,\n"
         content += f"segment{seg_num}.{extension}\n"
     
-    # Removed file linking/copying logic from here
-    
-    await atomic_file_write_with_retry(playlist_path, content)
+    return content
 
 if __name__ == "__main__":
     # Register signal handlers
