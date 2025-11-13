@@ -444,15 +444,16 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
     def normalize_timestamp(ts):
         """Convert Gladia timestamp to stream-relative timestamp."""
         if transcription_start_time is None:
-            return float(ts)  # Cannot normalize yet
-            
-        # Base normalization - relative to first transcript
-        normalized = float(ts) - transcription_start_time
-        
-        # Apply segment offset if available
-        if segment_time_offset is not None:
-            normalized += segment_time_offset
-            
+            return None  # Cannot normalize without transcription start time
+
+        if segment_time_offset is None:
+            return None  # Cannot normalize without proper synchronization
+
+        # Convert Gladia timestamp to stream timeline:
+        # 1. Gladia timestamp is relative to transcription start
+        # 2. Add the offset to align with segment timeline
+        normalized = float(ts) + segment_time_offset
+
         return normalized
     
     async for message in websocket:
@@ -471,16 +472,31 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                 if transcription_start_time is None:
                     transcription_start_time = float(start)
                     transcription_logger.info(f"Initialized transcription_start_time to {transcription_start_time}")
-                    
-                    # We need to synchronize with segment timestamps once they're available
+
+                    # Calculate the proper offset to align transcription with segments
                     if first_segment_timestamp is not None:
-                        # Simple offset to align transcription with segments
-                        segment_time_offset = 0  # Start with no offset
-                        transcription_logger.info(f"Timing references initialized - first transcript at {start}s, first segment at {first_segment_timestamp}")
-                
+                        # The first segment starts at time 0.0 in our normalized timeline
+                        # Gladia's first transcript is at 'start' seconds from when transcription began
+                        # We need to figure out where transcription start time maps to on the segment timeline
+                        # Since we can't know exactly when transcription started relative to segments,
+                        # we assume it started roughly at the beginning of the first segment (time 0)
+                        # So the offset is just the negative of transcription_start_time
+                        segment_time_offset = -transcription_start_time
+                        transcription_logger.info(
+                            f"Synchronized timelines: "
+                            f"transcription_start={transcription_start_time}s, "
+                            f"segment_time_offset={segment_time_offset}s, "
+                            f"first_segment={first_segment_timestamp}"
+                        )
+
                 # Normalize timestamps to stream timeline
                 stream_relative_start = normalize_timestamp(start)
                 stream_relative_end = normalize_timestamp(end)
+
+                # Skip if we don't have proper synchronization yet
+                if stream_relative_start is None or stream_relative_end is None:
+                    transcription_logger.debug("Skipping transcript - waiting for timeline synchronization")
+                    continue
                 
                 # Log transcription data
                 captions_logger.info(f"[RU] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
@@ -509,7 +525,12 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                         # Normalize timestamps
                         stream_relative_start = normalize_timestamp(start)
                         stream_relative_end = normalize_timestamp(end)
-                        
+
+                        # Skip if we don't have proper synchronization yet
+                        if stream_relative_start is None or stream_relative_end is None:
+                            transcription_logger.debug("Skipping translation - waiting for timeline synchronization")
+                            continue
+
                         if lang in ["en", "nl"] and text:
                             captions_logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
                             await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
@@ -529,10 +550,15 @@ async def process_transcription_messages(websocket: WebSocketClientProtocol) -> 
                         # Normalize timestamps
                         stream_relative_start = normalize_timestamp(start)
                         stream_relative_end = normalize_timestamp(end)
-                        
+
+                        # Skip if we don't have proper synchronization yet
+                        if stream_relative_start is None or stream_relative_end is None:
+                            transcription_logger.debug("Skipping translation - waiting for timeline synchronization")
+                            continue
+
                         text = translation["text"].strip()
                         lang = translation["target_language"]
-                        
+
                         if lang in ["en", "nl"] and text:
                             captions_logger.info(f"[{lang.upper()}] {format_duration(stream_relative_start)} --> {format_duration(stream_relative_end)} | {text}")
                             await store_caption_cue(lang, stream_relative_start, stream_relative_end, text)
@@ -610,26 +636,17 @@ async def update_overlapping_vtt_segments(language, start_time, end_time):
         for seg_num in current_segments:
             segment_start = (seg_num - first_segment_timestamp) * SEGMENT_DURATION
             segment_end = segment_start + SEGMENT_DURATION
-            
+
             transcription_logger.debug(f"Checking segment {seg_num}: {format_duration(segment_start)} -> {format_duration(segment_end)}")
-            
-            # Check for overlap with caption timespan (use more flexible matching)
-            if (start_time >= segment_start - 5 and start_time < segment_end + 5) or \
-               (end_time > segment_start - 5 and end_time <= segment_end + 5) or \
-               (start_time <= segment_start + 5 and end_time >= segment_end - 5):
-                
+
+            # Strict overlap check - caption must actually overlap with segment
+            # Two intervals [a1, a2] and [b1, b2] overlap if: a1 < b2 AND a2 > b1
+            if start_time < segment_end and end_time > segment_start:
                 transcription_logger.debug(f"Found overlap! Updating {language} segment {seg_num}")
                 # This segment needs to be updated
                 success = await create_vtt_segment(seg_num, language)
                 if success:
                     segments_updated.append(seg_num)
-        
-        # If no segments were updated due to the flexible matching, update the latest segment as fallback
-        if not segments_updated and current_segments:
-            latest_segment = max(current_segments)
-            transcription_logger.info(f"No overlapping segments found, updating latest segment {latest_segment} as fallback")
-            await create_vtt_segment(latest_segment, language)
-            segments_updated.append(latest_segment)
         
         # Update the subtitle playlist after any changes
         if segments_updated:
@@ -923,13 +940,20 @@ async def monitor_segments_and_create_vtt():
             if first_segment_timestamp is None and current_segments:
                 first_segment_timestamp = min(current_segments)
                 system_logger.info(f"Initialized first_segment_timestamp to {first_segment_timestamp}")
-                
+
                 # Important: Synchronize timing references
                 if transcription_start_time is not None:
-                    # Initialize with a simpler approach - just using normalized timestamps
-                    segment_time_offset = 0
-                    system_logger.info(f"Initialized segment_time_offset to 0 for simplified timestamp normalization")
-                    system_logger.info(f"Transcription start time: {transcription_start_time}, First segment: {first_segment_timestamp}")
+                    # Calculate the proper offset between transcription and segment timelines
+                    # Gladia timestamps are relative to transcription_start_time
+                    # Segment timestamps are relative to first_segment (which we normalize to 0)
+                    # The offset maps transcription timeline to segment timeline
+                    segment_time_offset = -transcription_start_time
+                    system_logger.info(
+                        f"Synchronized timelines: "
+                        f"transcription_start={transcription_start_time}s, "
+                        f"segment_time_offset={segment_time_offset}s, "
+                        f"first_segment={first_segment_timestamp}"
+                    )
             
             system_logger.info(f"Current segments: {current_segments}")
             system_logger.info(f"Processed segments: {processed_segments}")
