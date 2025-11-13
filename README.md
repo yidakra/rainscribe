@@ -87,6 +87,31 @@ CAPTIONS_LOG_LEVEL=DEBUG SYSTEM_LOG_LEVEL=DEBUG TRANSCRIPTION_LOG_LEVEL=DEBUG do
 CAPTIONS_LOG_LEVEL=INFO SYSTEM_LOG_LEVEL=INFO TRANSCRIPTION_LOG_LEVEL=ERROR docker-compose up --build
 ```
 
+## Technical Details
+
+### Timeline Synchronization
+
+One of the most critical aspects of Rainscribe is properly synchronizing two independent timelines:
+
+1. **Gladia Transcription Timeline**: Timestamps from the Gladia API are relative to when audio streaming to their service began. For example, the first transcript might arrive at timestamp 2.5s, meaning 2.5 seconds after the connection was established.
+
+2. **Video Segment Timeline**: FFmpeg generates HLS segments with epoch-based numbers that are normalized to start at 0.0s for the first segment.
+
+**The Synchronization Process**:
+- When the first transcript arrives from Gladia (e.g., at timestamp 2.5s), this is recorded as `transcription_start_time`
+- When the first video segment is detected, this establishes the segment timeline starting at 0.0s
+- The system calculates `segment_time_offset = -transcription_start_time` to align these timelines
+- All subsequent Gladia timestamps are converted to stream-relative timestamps using: `stream_time = gladia_time + segment_time_offset`
+- Captions are only processed after both timelines are established and synchronized
+
+This ensures captions appear at the correct time in the video stream, even though transcription and segment generation start at different moments.
+
+**Overlap Detection**:
+- For each caption, the system determines which video segments it overlaps with
+- Uses strict mathematical overlap: caption overlaps segment if `caption_start < segment_end AND caption_end > segment_start`
+- Captions that span multiple segments are correctly included in all relevant segment VTT files
+- Each VTT file contains only the captions that overlap with that specific segment's time window
+
 ## Detailed Operation
 
 ### INITIAL SETUP (First 60 seconds):
@@ -162,13 +187,54 @@ CAPTIONS_LOG_LEVEL=INFO SYSTEM_LOG_LEVEL=INFO TRANSCRIPTION_LOG_LEVEL=ERROR dock
 
 This architecture ensures that by the time any segment reaches the viewer, its captions are already prepared, synchronized, and ready to display. The drip-feed approach ensures that all viewers see the same content at the same relative point in time, maintaining a consistent 60-second delay.
 
+## Testing
+
+The project includes unit tests for the critical timestamp synchronization logic:
+
+```bash
+python3 test_timestamp_sync.py -v
+```
+
+These tests verify:
+- Timeline synchronization between Gladia transcription and video segments
+- Caption-to-segment overlap detection
+- WebVTT timestamp formatting
+- Edge cases like captions spanning multiple segments
+
 ## Troubleshooting
 
-- **No captions appear**: Check the logs with `TRANSCRIPTION_LOG_LEVEL=DEBUG` to see if transcriptions are being received and processed correctly.
-- **Stream doesn't play**: Verify that the HLS source URL is accessible and check system logs with `SYSTEM_LOG_LEVEL=DEBUG`.
-- **Multiple captions showing**: Only one caption track should be active at a time. Use the language buttons to switch between tracks.
-- **Container fails to start**: Ensure all required ports are available and the environment variables are set correctly.
-- **Caption timing issues**: If captions appear out of sync, check the logs for timing information and ensure both FFmpeg instances are running properly.
+### No captions appear
+Check the logs with `TRANSCRIPTION_LOG_LEVEL=DEBUG` to see if transcriptions are being received. Look for:
+- "Initialized transcription_start_time" - confirms transcription is starting
+- "Synchronized timelines" - confirms synchronization is complete
+- Caption log entries showing `[RU]`, `[EN]`, `[NL]` with timestamps
+
+If you see "Skipping transcript - waiting for timeline synchronization", the system is waiting for both timelines to be established. This should resolve within the first 10-20 seconds.
+
+### Captions appear at wrong time
+If captions are consistently early or late, check for these log messages:
+- "Synchronized timelines" - shows the `segment_time_offset` value
+- "Found overlap!" - shows which segments are being updated with captions
+
+The system automatically calculates the offset between transcription and video timelines. If this appears incorrect, ensure:
+1. Both FFmpeg instances are running (check with `SYSTEM_LOG_LEVEL=DEBUG`)
+2. Gladia API is responding with transcriptions
+3. Video segments are being created properly
+
+### Stream doesn't play
+Verify that the HLS source URL is accessible and check system logs with `SYSTEM_LOG_LEVEL=DEBUG`. Ensure the source stream is actually live and producing data.
+
+### Multiple captions showing simultaneously
+Only one caption track should be active at a time. Use the language buttons in the player to switch between Russian, English, and Dutch tracks. If multiple tracks appear simultaneously, this is a browser rendering issue - try refreshing the page.
+
+### Container fails to start
+Ensure all required ports are available and the environment variables are set correctly. The most common issue is port 8080 being in use by another service.
+
+### Captions missing for some segments
+This is usually caused by timing issues. Check:
+- Are transcriptions being received continuously? Look for gaps in the caption logs
+- Is the Gladia API connection stable? Check for WebSocket disconnection messages
+- Are VTT files being created? Check the `output/subtitles/` directory
 
 ## License
 
