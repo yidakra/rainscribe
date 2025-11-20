@@ -32,7 +32,7 @@ Live transcription with native HLS subtitle integration for HLS streaming.
    ```bash
    GLADIA_API_KEY=your_api_key_here
    STREAM_URL=https://your-hls-stream-url.m3u8  # Optional
-   
+
    # Logging configuration (optional)
    CAPTIONS_LOG_LEVEL=INFO    # Show caption text
    SYSTEM_LOG_LEVEL=ERROR     # Hide system messages
@@ -186,6 +186,77 @@ This ensures captions appear at the correct time in the video stream, even thoug
 - New viewers joining later see the same delayed point in the stream
 
 This architecture ensures that by the time any segment reaches the viewer, its captions are already prepared, synchronized, and ready to display. The drip-feed approach ensures that all viewers see the same content at the same relative point in time, maintaining a consistent 60-second delay.
+
+## Development
+
+### Setup Development Environment
+
+1. Install development dependencies:
+```bash
+pip install -r requirements-dev.txt
+```
+
+2. Install pre-commit hooks:
+```bash
+pre-commit install
+```
+
+### Code Quality Tools
+
+This project uses several tools to maintain code quality:
+
+- **Ruff**: Fast Python linter and formatter
+- **Mypy**: Static type checker
+- **Pytest**: Testing framework
+- **Bandit**: Security vulnerability scanner
+- **Pre-commit**: Git hooks for automated checks
+
+### Running Linters
+
+```bash
+# Run ruff linter
+ruff check .
+
+# Run ruff formatter
+ruff format .
+
+# Run type checker (informational)
+mypy rainscribe.py test_timestamp_sync.py
+
+# Run security scanner
+bandit -r . -x ./venv,./output
+```
+
+### Pre-commit Hooks
+
+Pre-commit hooks run automatically before each commit:
+- Ruff linting and formatting
+- Trailing whitespace removal
+- End-of-file fixer
+- YAML validation
+- Large file detection
+- Merge conflict detection
+
+To run hooks manually:
+```bash
+pre-commit run --all-files
+```
+
+To run mypy manually (not run automatically):
+```bash
+pre-commit run mypy --all-files
+```
+
+### Continuous Integration
+
+GitHub Actions CI runs on every push and pull request:
+- Linting with ruff
+- Type checking with mypy (informational)
+- Unit tests with pytest
+- Security scanning with bandit
+- Docker image build verification
+
+See `.github/workflows/ci.yml` for the full CI configuration.
 
 ## Testing
 

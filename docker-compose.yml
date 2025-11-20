@@ -23,7 +23,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    
+
     # Improve container performance
     deploy:
       resources:
@@ -33,7 +33,7 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
-    
+
     # Add logging configuration
     logging:
       driver: "json-file"

@@ -8,7 +8,6 @@ at the correct time in the video stream.
 """
 
 import unittest
-from collections import deque
 
 
 class TestTimestampSynchronization(unittest.TestCase):
@@ -100,20 +99,17 @@ class TestTimestampSynchronization(unittest.TestCase):
         self.initialize_segments(1000)
 
         # Verify offset calculation
-        self.assertEqual(self.segment_time_offset, -2.5,
-                        "Offset should be negative of transcription start time")
+        self.assertEqual(self.segment_time_offset, -2.5, "Offset should be negative of transcription start time")
 
         # Test normalization
         # Gladia sends timestamp 5.0 (2.5 seconds after transcription started)
         # Should map to 2.5 seconds in stream timeline
         result = self.normalize_timestamp(5.0)
-        self.assertEqual(result, 2.5,
-                        "Timestamp 5.0 should normalize to 2.5")
+        self.assertEqual(result, 2.5, "Timestamp 5.0 should normalize to 2.5")
 
         # Gladia's transcription_start_time (2.5) should map to stream time 0.0
         result = self.normalize_timestamp(2.5)
-        self.assertEqual(result, 0.0,
-                        "Transcription start should map to stream time 0.0")
+        self.assertEqual(result, 0.0, "Transcription start should map to stream time 0.0")
 
     def test_segments_before_transcription(self):
         """Test synchronization when segment tracking starts before transcription."""
@@ -124,17 +120,14 @@ class TestTimestampSynchronization(unittest.TestCase):
         self.initialize_transcription(3.2)
 
         # Verify offset calculation
-        self.assertEqual(self.segment_time_offset, -3.2,
-                        "Offset should be negative of transcription start time")
+        self.assertEqual(self.segment_time_offset, -3.2, "Offset should be negative of transcription start time")
 
         # Test normalization
         result = self.normalize_timestamp(3.2)
-        self.assertEqual(result, 0.0,
-                        "Transcription start should map to stream time 0.0")
+        self.assertEqual(result, 0.0, "Transcription start should map to stream time 0.0")
 
         result = self.normalize_timestamp(13.2)
-        self.assertEqual(result, 10.0,
-                        "10 seconds after transcription start should map to 10.0")
+        self.assertEqual(result, 10.0, "10 seconds after transcription start should map to 10.0")
 
     def test_caption_overlap_detection(self):
         """Test caption-to-segment overlap detection."""
@@ -154,13 +147,13 @@ class TestTimestampSynchronization(unittest.TestCase):
         # Segment 1000 = 0-10s, should overlap
         self.assertTrue(
             self.check_overlap(caption_start_stream, caption_end_stream, 1000),
-            "Caption [3.0, 6.0] should overlap with segment [0, 10]"
+            "Caption [3.0, 6.0] should overlap with segment [0, 10]",
         )
 
         # Segment 1001 = 10-20s, should NOT overlap
         self.assertFalse(
             self.check_overlap(caption_start_stream, caption_end_stream, 1001),
-            "Caption [3.0, 6.0] should not overlap with segment [10, 20]"
+            "Caption [3.0, 6.0] should not overlap with segment [10, 20]",
         )
 
     def test_caption_spanning_segments(self):
@@ -178,32 +171,29 @@ class TestTimestampSynchronization(unittest.TestCase):
 
         # Should overlap segment 2000 (0-10s)
         self.assertTrue(
-            self.check_overlap(caption_start, caption_end, 2000),
-            "Caption [9.0, 21.0] should overlap segment [0, 10]"
+            self.check_overlap(caption_start, caption_end, 2000), "Caption [9.0, 21.0] should overlap segment [0, 10]"
         )
 
         # Should overlap segment 2001 (10-20s)
         self.assertTrue(
-            self.check_overlap(caption_start, caption_end, 2001),
-            "Caption [9.0, 21.0] should overlap segment [10, 20]"
+            self.check_overlap(caption_start, caption_end, 2001), "Caption [9.0, 21.0] should overlap segment [10, 20]"
         )
 
         # Should overlap segment 2002 (20-30s)
         self.assertTrue(
-            self.check_overlap(caption_start, caption_end, 2002),
-            "Caption [9.0, 21.0] should overlap segment [20, 30]"
+            self.check_overlap(caption_start, caption_end, 2002), "Caption [9.0, 21.0] should overlap segment [20, 30]"
         )
 
         # Should NOT overlap segment 1999 (before)
         self.assertFalse(
             self.check_overlap(caption_start, caption_end, 1999),
-            "Caption [9.0, 21.0] should not overlap segment before"
+            "Caption [9.0, 21.0] should not overlap segment before",
         )
 
         # Should NOT overlap segment 2003 (after)
         self.assertFalse(
             self.check_overlap(caption_start, caption_end, 2003),
-            "Caption [9.0, 21.0] should not overlap segment [30, 40]"
+            "Caption [9.0, 21.0] should not overlap segment [30, 40]",
         )
 
     def test_edge_case_caption_at_boundary(self):
@@ -230,8 +220,7 @@ class TestTimestampSynchronization(unittest.TestCase):
 
         # Zero-duration captions at boundaries should not overlap either segment
         # This is correct behavior - such captions should be filtered out
-        self.assertFalse(overlap_5000 or overlap_5001,
-                        "Zero-duration caption at boundary should not overlap")
+        self.assertFalse(overlap_5000 or overlap_5001, "Zero-duration caption at boundary should not overlap")
 
     def test_realistic_scenario(self):
         """Test a realistic scenario with multiple captions."""

@@ -1,0 +1,19 @@
+# Development dependencies for linting, formatting, and testing
+
+# Linting and formatting
+ruff==0.6.9
+
+# Type checking
+mypy==1.11.2
+types-requests==2.32.0.20240914
+types-aiofiles==24.1.0.20240626
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# Security scanning
+bandit==1.7.10
+
+# Pre-commit hooks
+pre-commit==3.8.0
